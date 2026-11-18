@@ -7,9 +7,11 @@ package ui
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/ate-tooling/ate-tui/internal/proxy"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
@@ -22,8 +24,13 @@ type ConnInfo struct {
 
 // Options configures the UI.
 type Options struct {
-	// Connect runs in the background after the first frame is drawn.
-	Connect   func(ctx context.Context) (Backend, ConnInfo, error)
+	// Connect runs in the background after the first frame is drawn, and
+	// again for each :ctx switch. An empty kubeContext is Options.Context.
+	Connect func(ctx context.Context, kubeContext string) (Backend, ConnInfo, error)
+	// Contexts lists the kubeconfig contexts for :ctx; nil disables it.
+	Contexts func() ([]KubeContext, error)
+	// Context is the kube context to start on; empty is the current one.
+	Context   string
 	Refresh   time.Duration
 	Version   string
 	Kind      string
@@ -39,6 +46,13 @@ type Options struct {
 	ConfigPath string
 	// JournalPath is where action results are appended; empty disables it.
 	JournalPath string
+
+	// Keys rebinds table keys; the zero Keymap keeps the defaults.
+	Keys Keymap
+	// ProxyAddress is where forwards listen; empty is 127.0.0.1.
+	ProxyAddress string
+	// Copy puts text on the clipboard (OSC 52); nil disables copy.
+	Copy func(string) error
 }
 
 type mode int
@@ -49,6 +63,7 @@ const (
 	modeCommand
 	modePager
 	modeConfirm
+	modeForward
 )
 
 type viewKey struct {
@@ -58,6 +73,7 @@ type viewKey struct {
 
 type (
 	connectedMsg struct {
+		epoch   int
 		backend Backend
 		info    ConnInfo
 		err     error
@@ -80,9 +96,19 @@ type Model struct {
 	info       ConnInfo
 	connErr    error
 	connecting bool
+	// kubeCtx is the context being connected to; epoch counts connects so
+	// a slow one from an earlier context is dropped.
+	kubeCtx     string
+	epoch       int
+	contexts    []KubeContext
+	contextsErr error
 
 	width, height int
 	mode          mode
+	keys          Keymap
+	lastClick     time.Time
+	// wide shows every column and hides none on a narrow terminal (w).
+	wide bool
 
 	cur      viewKey
 	history  []viewKey
@@ -115,7 +141,11 @@ type Model struct {
 
 	confirm *confirm
 	batches map[int]*actionBatch
-	repoll  time.Duration
+
+	fwd        *fwdDialog
+	forwards   []*proxy.Forward
+	fwdPending int
+	repoll     time.Duration
 
 	started       time.Time
 	session       []journalEntry
@@ -131,8 +161,10 @@ func New(opts Options) *Model {
 	}
 	m := &Model{
 		opts:       opts,
+		keys:       opts.Keys,
 		connecting: true,
 		atespace:   opts.Atespace,
+		kubeCtx:    opts.Context,
 		data:       map[viewKey]*dataset{},
 		tables:     map[viewKey]*tableState{},
 		lastState:  map[string]string{},
@@ -157,13 +189,24 @@ func (m *Model) Init() tea.Cmd {
 
 func (m *Model) connect() tea.Cmd {
 	m.connecting = true
-	connect := m.opts.Connect
+	m.epoch++
+	connect, name, epoch := m.opts.Connect, m.kubeCtx, m.epoch
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		b, info, err := connect(ctx)
-		return connectedMsg{backend: b, info: info, err: err}
+		b, info, err := connect(ctx, name)
+		return connectedMsg{epoch: epoch, backend: b, info: info, err: err}
 	}
+}
+
+// Close stops the forwards and closes the connection. main calls it once
+// the program has exited.
+func (m *Model) Close() {
+	m.StopForwards()
+	if c, ok := m.backend.(interface{ Close() }); ok {
+		c.Close()
+	}
+	m.backend = nil
 }
 
 func (m *Model) tick() tea.Cmd {
@@ -181,6 +224,15 @@ func (m *Model) keyFor(k kind) viewKey {
 }
 
 func (m *Model) def() *kindDef { return lookupKind(string(m.cur.kind)) }
+
+// columns are a kind's columns, with its wide ones in wide mode.
+func (m *Model) columns(k kind) []string {
+	def := lookupKind(string(k))
+	if !m.wide || len(def.wide) == 0 {
+		return def.columns
+	}
+	return append(slices.Clip(def.columns), def.wide...)
+}
 
 func (m *Model) ds(k viewKey) *dataset {
 	d := m.data[k]
@@ -227,7 +279,7 @@ func (m *Model) fetch(k viewKey) tea.Cmd {
 // setView switches the table to k, showing cached rows at once.
 func (m *Model) setView(k viewKey, pushHistory bool) tea.Cmd {
 	m.closePager()
-	m.mode, m.confirm = modeTable, nil
+	m.mode, m.confirm, m.fwd = modeTable, nil, nil
 	if k != m.cur {
 		clear(m.table().marked)
 	}
@@ -241,7 +293,7 @@ func (m *Model) setView(k viewKey, pushHistory bool) tea.Cmd {
 	}
 	t := m.table()
 	if d := m.data[k]; d != nil {
-		t.rebuild(d.rows, m.def().columns, m.keepID(m.selectedID()))
+		t.rebuild(d.rows, m.columns(k.kind), m.keepID(m.selectedID()))
 		t.clamp(m.tableHeight())
 		if m.selectedID() == m.want.id {
 			m.want = wantRow{}
@@ -265,7 +317,7 @@ func (m *Model) gotoKind(k kind, filter string) tea.Cmd {
 	t := m.tableFor(key)
 	t.filter = filter
 	if d := m.data[key]; d != nil {
-		t.rebuild(d.rows, lookupKind(string(k)).columns, "")
+		t.rebuild(d.rows, m.columns(k), "")
 	}
 	return m.setView(key, true)
 }
@@ -314,6 +366,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case connectedMsg:
+		if msg.epoch != m.epoch {
+			// A connect to a context we have since left.
+			if c, ok := msg.backend.(interface{ Close() }); ok {
+				go c.Close()
+			}
+			return m, nil
+		}
 		m.connecting = false
 		if msg.err != nil {
 			m.connErr = msg.err
@@ -325,7 +384,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.setStatus("Viewing "+string(m.cur.kind), false)
 		// Warm the views people jump to first, all in parallel.
 		return m, tea.Batch(m.fetch(m.cur), m.fetch(viewKey{kAtespaces, ""}),
-			m.fetch(viewKey{kWorkers, ""}), m.fetch(viewKey{kActors, m.atespace}))
+			m.fetch(viewKey{kWorkers, ""}), m.fetch(viewKey{kActors, m.atespace}), m.loadContexts())
+
+	case contextsMsg:
+		m.contextsLoaded(msg)
+		return m, nil
 
 	case fetchedMsg:
 		var cmd tea.Cmd
@@ -359,7 +422,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.setStatus("Viewing "+string(m.cur.kind), false)
 			}
 			t := m.table()
-			t.rebuild(d.rows, m.def().columns, keep)
+			t.rebuild(d.rows, m.columns(msg.key.kind), keep)
 			t.clamp(m.tableHeight())
 			if m.want.id != "" && m.selectedID() == m.want.id {
 				m.want = wantRow{}
@@ -413,6 +476,20 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.fetch(msg.key)
 
+	case fwdStartedMsg:
+		return m, m.forwardStarted(msg)
+
+	case fwdStoppedMsg:
+		return m, nil
+
+	case copiedMsg:
+		if msg.err != nil {
+			m.setStatus("copy: "+msg.err.Error(), true)
+		} else {
+			m.setStatus("Copied "+msg.what, false)
+		}
+		return m, nil
+
 	case journalMsg:
 		if msg.err != nil {
 			m.setStatus(m.status+"  (journal: "+msg.err.Error()+")", true)
@@ -429,6 +506,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		return m, m.handleKey(msg)
+
+	case tea.MouseMsg:
+		return m, m.handleMouse(msg)
 	}
 	return m, nil
 }

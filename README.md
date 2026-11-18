@@ -8,6 +8,8 @@ unhealthy.
 ```
 brew install ate-tooling/tap/ate-tui
 # or
+nix run github:ate-tooling/ate-tui
+# or
 go install github.com/ate-tooling/ate-tui/cmd/ate-tui@latest
 ate-tui                 # current kubeconfig context, all atespaces
 ate-tui -a research     # start in one atespace
@@ -28,6 +30,59 @@ ate-tui connects the way `kubectl ate` does:
 `ATE_NAMESPACE`, `ATE_API_SERVICE_NAME` and `ATE_CLIENT_SERVICE_ACCOUNT`
 override the defaults, as they do for `kubectl ate`. WorkerPools and worker pod
 logs come from the Kubernetes API.
+
+`:ctx` lists the kubeconfig contexts, and `:ctx <name>` switches to one and
+reconnects. A switch drops the cached views, the timeline and the open
+forwards (each stop is journaled), and starts on every atespace. It waits
+while writes or proxy starts are still running, so their results are
+journaled against the context they ran on. `--endpoint` and `--token-file`
+apply only to the context ate-tui started on. After a switch, ate-tui
+port-forwards and mints a token as usual. Write permission is checked per
+context: `--write` covers every context, and `writeContexts` only the ones it
+lists.
+
+## Config
+
+`~/.config/ate-tui/config.yaml` (`$XDG_CONFIG_HOME` is honored). Every field
+is optional, and flags override the file. Unknown fields and impossible
+values stop ate-tui at start with the path and the reason.
+
+```yaml
+refresh: 2s                  # poll interval; --refresh overrides; minimum 250ms
+defaultView: actors          # the view at start; a kind argument overrides
+atespace: research           # start scoped to an atespace; -a overrides
+skin: catppuccin-mocha       # or -macchiato, -frappe, -latte, or a custom skin; --skin overrides
+colors:                      # override single colors on top of the skin
+  blue: "#89b4fa"
+mouse: true                  # wheel scrolls, click selects, double click opens
+proxyAddress: 127.0.0.1      # where f forwards listen
+writeContexts: [kind-dev]    # contexts where writes are allowed without --write
+keys:                        # rebind table keys: action: key
+  suspend: ctrl+s
+  yaml: "Y"                  # quote y, Y, n, N, on and off: YAML reads them as booleans
+```
+
+**Skins.** A custom skin lives in `~/.config/ate-tui/skins/<name>.yaml`. It
+names a built-in to start from and the colors to change. The colors are
+the Catppuccin names the UI uses: `red peach yellow green teal sky blue
+lavender mauve pink text subtext0 overlay2 overlay1 overlay0 surface1
+base`.
+
+```yaml
+base: catppuccin-latte
+colors:
+  blue: "#0055cc"
+```
+
+**Keys.** These actions can be rebound: `quit down up top bottom page-down
+page-up filter command help back forward next-view prev-view all-atespaces
+sort invert faults mark refresh wide copy explain yaml relations logs proxy
+egress events timeline worker template pool suspend resume revert delete
+drain available unavailable`. A key is one character, `ctrl+x`, `alt+x`,
+`tab`, `f1`–`f12`, or `space`. A rebound action's old key does nothing. Two
+actions on one key is an error. `enter`, `esc`, `ctrl+c` and the arrow and
+page keys keep their meaning. The header, the footer and `?` show the keys as
+bound. Keys inside pagers and dialogs are fixed.
 
 ## Safety
 
@@ -58,7 +113,7 @@ The header then shows `[write]`. `--demo` allows writes only with `--write`.
 
 | Key | Action |
 | --- | --- |
-| `:` | command palette: `:actors [atespace]`, `:workers`, `:templates`, `:workerpools`, `:atespaces`, `:tags`, `:pulse`, `:access`, `:timeline`, `:journal`, `:q` |
+| `:` | command palette: `:actors [atespace]`, `:workers`, `:templates`, `:workerpools`, `:atespaces`, `:tags`, `:pulse`, `:access`, `:timeline`, `:journal`, `:pf`, `:ctx [name]`, `:q` |
 | `/` | filter (space = AND, `!term` = NOT); `esc` clears |
 | `ctrl-z` | faults only: crashed, stuck, draining, full, not ready |
 | `tab` / `shift-tab` | cycle views |
@@ -73,6 +128,9 @@ The header then shows `[write]`. `--demo` allows writes only with `--write`.
 | `e` | actor: egress policy |
 | `E` | actor or worker: Kubernetes events of the worker pod |
 | `T` | actor timeline of state changes seen this session |
+| `w` | wide: extra columns (actors: pod, sandbox, crash, uid; workers: namespace, epochs, labels, uid; …) and none hidden on a narrow terminal |
+| `c` | copy the row's name, or a pager's text (`C` in logs), with OSC 52; works over SSH and in tmux |
+| `f` | actor: forward local ports through atenet-router (see [Proxy](#proxy)) |
 | `o` / `t` / `p` | jump to worker / template / pool |
 | `r` | refresh now, or reconnect |
 | `space` | mark / unmark the row |
@@ -83,6 +141,7 @@ The header then shows `[write]`. `--demo` allows writes only with `--write`.
 | `D` | worker: drain (one-way) |
 | `A` / `U` | worker: mark available / unavailable |
 | `?` | help |
+| mouse | wheel scrolls; click selects a row; double click opens it (`mouse: false` turns it off, which brings back the terminal's own text selection) |
 
 ## Logs
 
@@ -136,6 +195,33 @@ suspended pause in between, so you can watch this happen.
 - **`E` events:** core/v1 events for the worker pod hosting the actor, or the
   selected worker's pod (field selector `involvedObject.name`), newest first.
 
+## Proxy
+
+`f` on an actor forwards local ports to it through atenet-router, as
+`kubectl ate proxy actor` does. The dialog takes `[local:]remote` specs,
+separated by spaces. It starts at `8000:80`, or the next free local port
+when 8000 is already forwarded. A local port of `0` picks any free port.
+ate-tui listens on `127.0.0.1`. Either every port in the dialog starts or
+none of them does.
+
+The proxy is gated like a write. It needs `--write` or a `writeContexts`
+entry, and the dialog is the confirmation. Starting a proxy mints a router
+client certificate with a PodCertificateRequest in Substrate's system
+namespace, and the router resumes a suspended actor when a connection
+arrives. The dialog warns you when the actor is suspended. The first proxy
+in a session waits for the podidentity signer. Later proxies reuse the
+certificate, which is renewed at half its lifetime. Each connection opens its
+own port-forward to a ready router pod, as kubectl-ate does.
+
+`:pf` lists forwards with open/total connections, bytes in each direction,
+age and status. The full text of the selected forward's last dial error is
+shown under the list. `⏎` jumps to the actor and `ctrl-d` stops the forward.
+The header shows `⇄ N` while forwards are listening. Starts and stops go to
+the journal. Quitting closes every forward.
+
+In `--demo`, each forward reaches a small HTTP server that says which actor
+answered: `curl localhost:8000`.
+
 ## Explain
 
 `X` diagnoses from ateapi data alone:
@@ -150,6 +236,16 @@ suspended pause in between, so you can watch this happen.
 - **Templates:** golden snapshot status and the actor states built from the template.
 - **WorkerPools:** ready replicas, sandbox class resolution, and how many workers registered.
 
+## Release
+
+Pushing a `v*` tag runs GoReleaser. It builds darwin and linux for amd64 and
+arm64, publishes the GitHub release, and updates the `ate-tui` cask in
+`ate-tooling/homebrew-tap`, which needs the `HOMEBREW_TAP_TOKEN` secret.
+`flake.nix` builds the same binary with `buildGoModule` (`nix build`,
+`nix run`, and `nix develop` for go, gopls and goreleaser). CI runs vet and
+the race tests, a GoReleaser snapshot, and `nix build`. A stale `vendorHash`
+after a `go.mod` change fails that job and prints the hash to put in.
+
 ## Design
 
 Every network call runs in a Bubble Tea command, so keys never wait on I/O.
@@ -162,8 +258,11 @@ and a frame ~0.2ms (`go test ./internal/ui -bench .`).
 
 ```
 cmd/ate-tui        flags, wiring
-internal/ateconn   port-forward, trust bundle, token, paged List calls, writes
-internal/config    config.yaml (write allowlist), XDG paths
+internal/ateconn   port-forward, trust bundle, token, paged List calls, writes,
+                   atenet-router CONNECT dialer and podidentity certificate
+internal/proxy     local listeners and tunnel copying for f / :pf (tested)
+internal/config    config.yaml, XDG paths
+internal/skin      built-in Catppuccin palettes and custom skin files
 internal/explain   pure diagnosis functions (tested)
 internal/ui        model, views, keys, pager (yaml/explain/timeline/journal),
                    logs follow, relations, pulse, policies and events,

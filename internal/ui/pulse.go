@@ -318,15 +318,8 @@ func (d *pulseData) status(section string) (string, bool) {
 	return "", false
 }
 
-var stateStyle = map[ateapi.ActorState]lipgloss.Style{
-	ateapi.ActorState_ACTOR_STATE_RUNNING:    fg(cGreen),
-	ateapi.ActorState_ACTOR_STATE_SUSPENDED:  fg(cSubtext0),
-	ateapi.ActorState_ACTOR_STATE_RESUMING:   fg(cPeach),
-	ateapi.ActorState_ACTOR_STATE_SUSPENDING: fg(cPeach),
-	ateapi.ActorState_ACTOR_STATE_REVERTING:  fg(cPeach),
-	ateapi.ActorState_ACTOR_STATE_CRASHED:    fg(cRed).Bold(true),
-	ateapi.ActorState_ACTOR_STATE_DELETING:   fg(cOverlay0),
-}
+// stateStyle is set by ApplySkin.
+var stateStyle map[ateapi.ActorState]lipgloss.Style
 
 // shortStates label the count columns when the full names do not fit.
 var shortStates = map[ateapi.ActorState]string{

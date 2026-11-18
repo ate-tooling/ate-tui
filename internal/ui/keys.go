@@ -26,10 +26,10 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	// Bubble Tea groups runes that arrive together, as with a paste or fast
 	// typing. Outside text entry, replay them one key at a time so "/crash"
 	// opens the filter with "crash".
-	if msg.Type == tea.KeyRunes && len(msg.Runes) > 1 && m.mode != modeFilter && m.mode != modeCommand {
+	if msg.Type == tea.KeyRunes && len(msg.Runes) > 1 && m.mode != modeFilter && m.mode != modeCommand && m.mode != modeForward {
 		var cmds []tea.Cmd
 		for i, r := range msg.Runes {
-			if m.mode == modeFilter || m.mode == modeCommand {
+			if m.mode == modeFilter || m.mode == modeCommand || m.mode == modeForward {
 				cmds = append(cmds, m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: msg.Runes[i:], Paste: msg.Paste}))
 				break
 			}
@@ -41,6 +41,14 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return tea.Batch(cmds...)
 	}
 	switch m.mode {
+	case modeTable:
+		key, ok := m.keys.translate(msg.String())
+		if !ok {
+			return nil
+		}
+		return m.keyTable(key)
+	case modeForward:
+		return m.keyForward(msg)
 	case modeFilter:
 		return m.keyFilter(msg)
 	case modeCommand:
@@ -48,7 +56,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	case modePager:
 		return m.keyPager(msg)
 	}
-	return m.keyTable(msg)
+	return m.keyTable(msg.String())
 }
 
 func (m *Model) quit() tea.Cmd {
@@ -56,7 +64,8 @@ func (m *Model) quit() tea.Cmd {
 	return tea.Quit
 }
 
-func (m *Model) keyTable(msg tea.KeyMsg) tea.Cmd {
+// keyTable handles a table key, already translated to its default.
+func (m *Model) keyTable(key string) tea.Cmd {
 	t := m.table()
 	h := m.tableHeight()
 	move := func(n int) tea.Cmd {
@@ -64,7 +73,7 @@ func (m *Model) keyTable(msg tea.KeyMsg) tea.Cmd {
 		t.clamp(h)
 		return nil
 	}
-	switch msg.String() {
+	switch key {
 	case "q":
 		return m.quit()
 	case "j", "down":
@@ -79,6 +88,21 @@ func (m *Model) keyTable(msg tea.KeyMsg) tea.Cmd {
 		return move(h)
 	case "ctrl+b", "pgup":
 		return move(-h)
+	case "w":
+		m.wide = !m.wide
+		t.sortCol = min(t.sortCol, len(m.columns(m.cur.kind))-1)
+		m.rebuild()
+		if m.wide {
+			m.setStatus("Wide: every column", false)
+		} else {
+			m.setStatus("Viewing "+string(m.cur.kind), false)
+		}
+		return nil
+	case "c":
+		if r := m.selected(); r != nil {
+			return m.copy(r.id)
+		}
+		return nil
 	case "/":
 		m.mode, m.input = modeFilter, t.filter
 		return nil
@@ -102,7 +126,7 @@ func (m *Model) keyTable(msg tea.KeyMsg) tea.Cmd {
 		return m.historyMove(1)
 	case "tab", "shift+tab":
 		step := 1
-		if msg.String() == "shift+tab" {
+		if key == "shift+tab" {
 			step = len(tabKinds) - 1
 		}
 		i := 0
@@ -115,8 +139,9 @@ func (m *Model) keyTable(msg tea.KeyMsg) tea.Cmd {
 	case "0":
 		return m.setAtespace("")
 	case "S":
-		t.sortCol = (t.sortCol + 1) % len(m.def().columns)
-		m.setStatus("Sort by "+m.def().columns[t.sortCol], false)
+		cols := m.columns(m.cur.kind)
+		t.sortCol = (t.sortCol + 1) % len(cols)
+		m.setStatus("Sort by "+cols[t.sortCol], false)
 		m.rebuild()
 		return nil
 	case "I":
@@ -143,14 +168,14 @@ func (m *Model) keyTable(msg tea.KeyMsg) tea.Cmd {
 		return m.fetch(m.cur)
 	}
 
-	if a := lookupAction(m.cur.kind, msg.String()); a != nil {
+	if a := lookupAction(m.cur.kind, key); a != nil {
 		return m.startAction(a)
 	}
 	r := m.selected()
 	if r == nil {
 		return nil
 	}
-	return m.keyRow(msg.String(), r)
+	return m.keyRow(key, r)
 }
 
 // keyRow handles keys that act on the selected row.
@@ -170,6 +195,8 @@ func (m *Model) keyRow(key string, r *row) tea.Cmd {
 			return m.openExplain(m.cur, r.id)
 		case "l":
 			return m.openLogs(o)
+		case "f":
+			return m.openForward(o)
 		case "e":
 			return m.openEgress(o)
 		case "E":
@@ -234,7 +261,7 @@ func (m *Model) keyRow(key string, r *row) tea.Cmd {
 func (m *Model) rebuild() {
 	t := m.table()
 	if d := m.data[m.cur]; d != nil {
-		t.rebuild(d.rows, m.def().columns, m.selectedID())
+		t.rebuild(d.rows, m.columns(m.cur.kind), m.selectedID())
 		t.clamp(m.tableHeight())
 	}
 }
@@ -293,7 +320,7 @@ func (m *Model) keyFilter(msg tea.KeyMsg) tea.Cmd {
 		return nil
 	case tea.KeyUp, tea.KeyDown:
 		m.mode = modeTable
-		return m.keyTable(msg)
+		return m.keyTable(msg.String())
 	}
 	if m.editInput(msg) {
 		t.filter = m.input
@@ -338,7 +365,7 @@ func (m *Model) keyCommand(msg tea.KeyMsg) tea.Cmd {
 	return nil
 }
 
-var builtinCommands = []string{"quit", "help", "pulse", "access", "timeline", "journal", "all"}
+var builtinCommands = []string{"quit", "help", "pulse", "access", "timeline", "journal", "pf", "ctx", "all"}
 
 // updateSuggestions completes the word under the cursor: a kind or command
 // first, then an atespace name.
@@ -356,6 +383,12 @@ func (m *Model) updateSuggestions() {
 		pool = append(pool, builtinCommands...)
 		if len(fields) == 1 {
 			prefix = fields[0]
+		}
+	case fields[0] == "ctx" || fields[0] == "context":
+		pool = m.contextNames(fields[0])
+		prefix = strings.Join(fields, " ")
+		if trailing {
+			prefix += " "
 		}
 	default:
 		head := fields[0]
@@ -420,7 +453,8 @@ func (m *Model) isCommand(in string) bool {
 		return false
 	}
 	switch fields[0] {
-	case "q", "q!", "quit", "exit", "help", "h", "pulse", "access", "timeline", "events", "journal", "all":
+	case "q", "q!", "quit", "exit", "help", "h", "pulse", "access", "timeline", "events", "journal", "all",
+		"pf", "portforwards", "forwards", "ctx", "context", "contexts":
 		return true
 	}
 	return lookupKind(fields[0]) != nil
@@ -449,6 +483,14 @@ func (m *Model) runCommand(in string) tea.Cmd {
 		return nil
 	case "journal":
 		return m.openJournal()
+	case "pf", "portforwards", "forwards":
+		m.openForwards()
+		return nil
+	case "ctx", "context", "contexts":
+		if len(fields) > 1 {
+			return m.switchContext(fields[1])
+		}
+		return m.openContexts()
 	case "pulse":
 		return m.openPulse()
 	case "access":
@@ -476,11 +518,25 @@ func (m *Model) runCommand(in string) tea.Cmd {
 
 func (m *Model) keyPager(msg tea.KeyMsg) tea.Cmd {
 	p := m.pager
+	// c copies the pager's text; in logs, where c picks the source, C does.
+	if key := msg.String(); (key == "c" && m.logs == nil) || (key == "C" && m.logs != nil && !m.logs.searching) {
+		return m.copy(pagerText(p.lines))
+	}
 	if m.logs != nil && m.keyLogs(msg) {
 		return nil
 	}
 	if p.items != nil {
 		if ok, cmd := m.keyRelations(msg.String()); ok {
+			return cmd
+		}
+	}
+	if p.forwards {
+		if ok, cmd := m.keyForwards(msg.String()); ok {
+			return cmd
+		}
+	}
+	if p.contexts {
+		if ok, cmd := m.keyContexts(msg.String()); ok {
 			return cmd
 		}
 	}

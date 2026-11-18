@@ -73,8 +73,7 @@ func readJournal(path string) ([]journalEntry, error) {
 	return out, sc.Err()
 }
 
-// journal records an action result in memory now and on disk off the UI
-// goroutine.
+// journal records an action result.
 func (m *Model) journal(bt *actionBatch, id string, err error) tea.Cmd {
 	e := journalEntry{Time: time.Now(), Context: m.info.Context, Action: bt.act.name, Object: id, Result: "ok"}
 	if bt.act.name == "suspend" {
@@ -86,6 +85,11 @@ func (m *Model) journal(bt *actionBatch, id string, err error) tea.Cmd {
 	if err != nil {
 		e.Result, e.Error = "error", errString(err)
 	}
+	return m.record(e)
+}
+
+// record keeps e in memory now and appends it to disk off the UI goroutine.
+func (m *Model) record(e journalEntry) tea.Cmd {
 	m.session = append(m.session, e)
 	if over := len(m.session) - maxJournal; over > 0 {
 		m.session = append(m.session[:0], m.session[over:]...)

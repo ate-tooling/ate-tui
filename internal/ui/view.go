@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -48,6 +49,9 @@ func (m *Model) View() string {
 	}
 	if m.mode == modeConfirm && m.confirm != nil {
 		overlay(body, m.viewConfirm(len(body)), m.width)
+	}
+	if m.mode == modeForward && m.fwd != nil {
+		overlay(body, m.viewForward(len(body)), m.width)
 	}
 	for _, l := range body {
 		b.WriteString(l)
@@ -106,6 +110,9 @@ func (m *Model) viewHeader() []string {
 	}
 	ctx := m.info.Context
 	if ctx == "" {
+		ctx = m.kubeCtx
+	}
+	if ctx == "" {
 		ctx = m.opts.ConnLabel
 	}
 	cluster := m.info.Cluster
@@ -121,7 +128,7 @@ func (m *Model) viewHeader() []string {
 		total = len(d.rows)
 	}
 	info := []string{
-		stLabel.Render("Context:   ") + stContext.Render(ctx) + "  " + m.badge(),
+		stLabel.Render("Context:   ") + stContext.Render(ctx) + "  " + m.badge() + m.fwdBadge(),
 		stLabel.Render("Cluster:   ") + stCluster.Render(cluster),
 		stLabel.Render("Atespace:  ") + stAtespace.Render(scope),
 		stLabel.Render("Resource:  ") + stResource.Render(string(m.cur.kind)),
@@ -139,7 +146,7 @@ func (m *Model) viewHeader() []string {
 			idx := c*5 + i
 			if idx < len(hints) {
 				h := hints[idx]
-				lines[i] += fit(stHintKey.Render(h.key)+" "+stHintDesc.Render(h.desc), hintW)
+				lines[i] += fit(stHintKey.Render(m.keys.show(h.key))+" "+stHintDesc.Render(h.desc), hintW)
 			}
 		}
 	}
@@ -229,14 +236,23 @@ func (m *Model) viewTable() []string {
 	if n := len(t.marked); n > 0 {
 		title += " " + stMark.Render(fmt.Sprintf("marked %d", n))
 	}
-
-	natural := t.widths
-	if len(natural) != len(def.columns) {
-		natural = headerWidths(def.columns)
+	if m.wide {
+		title += " " + stDim.Render("wide")
 	}
-	widths := layoutWidths(natural, inner-2, def.drop)
-	cols := make([]string, len(def.columns))
-	copy(cols, def.columns)
+
+	columns := m.columns(m.cur.kind)
+	natural := t.widths
+	if len(natural) != len(columns) {
+		natural = headerWidths(columns)
+	}
+	// Wide mode hides nothing and keeps columns readable, letting the
+	// last ones run off the edge on a narrow terminal.
+	drop, floor := def.drop, 6
+	if m.wide {
+		drop, floor = nil, 12
+	}
+	widths := layoutWidths(natural, inner-2, drop, floor)
+	cols := slices.Clone(columns)
 	if t.sortCol < len(cols) {
 		arrow := "↑"
 		if t.sortDesc {
@@ -334,15 +350,24 @@ func (m *Model) viewFooter() []string {
 			hints = []hint{{"⏎", "search"}, {"esc", "cancel"}}
 		case m.logs != nil:
 			hints = append(hints, hint{"f", "follow"}, hint{"/", "search"}, hint{"n/N", "next/prev"},
-				hint{"c", "source"}, hint{"w", "wrap"})
+				hint{"c", "source"}, hint{"w", "wrap"}, hint{"C", "copy"})
 		case m.pager != nil && m.pager.items != nil:
 			hints = []hint{{"esc", "back"}, {"j/k", "move"}, {"⏎", "jump"}}
+		case m.pager != nil && m.pager.contexts:
+			hints = []hint{{"esc", "back"}, {"j/k", "move"}, {"⏎", "switch"}}
+		case m.pager != nil && m.pager.forwards:
+			hints = []hint{{"esc", "back"}, {"j/k", "move"}, {"⏎", "actor"}, {"^d", "stop"}}
+		}
+		if m.logs == nil {
+			hints = append(hints, hint{"c", "copy"})
 		}
 		hints = append(hints, hint{":", "resource"}, hint{"?", "help"})
 	case modeFilter:
 		hints = []hint{{"⏎", "keep"}, {"esc", "clear"}, {"!term", "exclude"}}
 	case modeCommand:
 		hints = []hint{{"tab", "complete"}, {"↑↓", "choose"}, {"⏎", "run"}, {"esc", "cancel"}}
+	case modeForward:
+		hints = []hint{{"⏎", "start"}, {"^u", "clear"}, {"esc", "cancel"}}
 	case modeConfirm:
 		if m.confirm != nil && m.confirm.act.typed {
 			hints = []hint{{"⏎", "confirm"}, {"esc", "cancel"}}
@@ -351,7 +376,11 @@ func (m *Model) viewFooter() []string {
 		}
 	default:
 		hints = []hint{{":", "resource"}, {"/", "filter"}, {"S", "sort"}, {"I", "invert"},
-			{"^z", "faults"}, {"[ ]", "history"}, {"0", "all-atespaces"}, {"␣", "mark"}, {"?", "help"}}
+			{"ctrl+z", "faults"}, {"[ ]", "history"}, {"0", "all-atespaces"}, {"w", "wide"}, {"c", "copy"},
+			{" ", "mark"}, {"?", "help"}}
+		for i := range hints {
+			hints[i].key = m.keys.show(hints[i].key)
+		}
 	}
 	var parts []string
 	for _, h := range hints {

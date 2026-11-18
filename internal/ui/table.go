@@ -151,8 +151,9 @@ const (
 )
 
 // layoutWidths fits column widths into avail. It first hides the columns in
-// drop order (width 0), then shrinks the widest column.
-func layoutWidths(natural []int, avail int, drop []int) []int {
+// drop order (width 0), then shrinks the widest column down to floor; what
+// still does not fit runs off the right edge.
+func layoutWidths(natural []int, avail int, drop []int, floor int) []int {
 	w := make([]int, len(natural))
 	total := 0
 	for i, n := range natural {
@@ -187,7 +188,7 @@ func layoutWidths(natural []int, avail int, drop []int) []int {
 				widest = i
 			}
 		}
-		if w[widest] <= 6 {
+		if w[widest] <= floor {
 			break
 		}
 		w[widest]--

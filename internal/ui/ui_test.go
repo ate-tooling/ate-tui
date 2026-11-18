@@ -42,7 +42,7 @@ func drive(m *Model, cmd tea.Cmd) {
 func demoModel(t *testing.T, w, h int) *Model {
 	t.Helper()
 	m := New(Options{
-		Connect: func(context.Context) (Backend, ConnInfo, error) {
+		Connect: func(context.Context, string) (Backend, ConnInfo, error) {
 			return demo.New(), ConnInfo{Context: "demo", Cluster: "https://demo"}, nil
 		},
 		Refresh: time.Hour,
@@ -114,6 +114,11 @@ func TestFrameFitsTerminal(t *testing.T) {
 			{"esc", ":", "pulse", "enter"},
 			{"j", "G"},
 			{"esc", ":", "access", "enter"},
+			{"esc", ":", "actors", "enter", "f"},
+			{"esc", ":", "pf", "enter"},
+			{"esc", "w"},
+			{":", "ctx", "enter"},
+			{"esc", "w"},
 			{"esc", ":", "actors", "enter", "u"},
 			{"j", "j"},
 			{"enter"},
@@ -194,7 +199,7 @@ func TestFormatLogLine(t *testing.T) {
 
 func TestLayoutWidthsDropsThenRestores(t *testing.T) {
 	// NAME(10) BIG(30) SMALL(3); avail fits NAME+SMALL but not BIG.
-	w := layoutWidths([]int{10, 30, 3}, 20, []int{2, 1})
+	w := layoutWidths([]int{10, 30, 3}, 20, []int{2, 1}, 6)
 	if w[1] != 0 || w[2] != 3 {
 		t.Fatalf("widths %v: want BIG hidden and SMALL restored", w)
 	}

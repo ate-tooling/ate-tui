@@ -82,7 +82,7 @@ func logActor(state ateapi.ActorState, pod string) *ateapi.Actor {
 func logModel(t *testing.T, b *logBackend) *Model {
 	t.Helper()
 	m := New(Options{
-		Connect: func(context.Context) (Backend, ConnInfo, error) { return b, ConnInfo{Context: "test"}, nil },
+		Connect: func(context.Context, string) (Backend, ConnInfo, error) { return b, ConnInfo{Context: "test"}, nil },
 		Refresh: time.Hour,
 	})
 	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})

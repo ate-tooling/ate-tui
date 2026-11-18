@@ -28,14 +28,14 @@ in config, and every write asks for confirmation.
   and does not predict permissions.
 - `E`: Kubernetes events for the hosting worker pod.
 
-## Milestone 4: Proxy
+## Milestone 4 (done): Proxy
 
 - `f` on an actor forwards a local port through atenet-router, like
   `kubectl ate proxy actor`. The router dial logic lives in substrate's
   internal `ateclient`, so it needs a local copy.
 - `:pf` lists active forwards and stops them.
 
-## Milestone 5: Config and release
+## Milestone 5 (done): Config and release
 
 - Config file: refresh interval, default view, keybindings, skins, write
   allowlist per context.

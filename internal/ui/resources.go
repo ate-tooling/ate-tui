@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
+	"sort"
 	"strings"
 	"time"
 
@@ -32,6 +34,11 @@ type Backend interface {
 	PodLogs(ctx context.Context, namespace, pod string, opts *corev1.PodLogOptions) (io.ReadCloser, error)
 	PodEvents(ctx context.Context, namespace, pod string) ([]corev1.Event, error)
 
+	// PrepareProxy mints what DialActor needs and may take a while.
+	// DialActor tunnels to an actor port; the router resumes a suspended actor.
+	PrepareProxy(ctx context.Context) error
+	DialActor(ctx context.Context, ref *ateapi.ObjectRef, port int) (net.Conn, error)
+
 	SuspendActor(ctx context.Context, ref *ateapi.ObjectRef, mode ateapi.DurabilityMode) (*ateapi.Actor, error)
 	ResumeActor(ctx context.Context, ref *ateapi.ObjectRef) (*ateapi.Actor, error)
 	RevertActor(ctx context.Context, ref *ateapi.ObjectRef) (*ateapi.Actor, error)
@@ -53,7 +60,8 @@ const (
 	kAssignments kind = "assignments"
 )
 
-// hint is one key shown in the header.
+// hint is one key shown in the header. Kind and table hints name the
+// default key, which the keymap shows as rebound.
 type hint struct{ key, desc string }
 
 type kindDef struct {
@@ -62,6 +70,9 @@ type kindDef struct {
 	// scoped kinds are filtered by the current atespace.
 	scoped  bool
 	columns []string
+	// wide columns are appended in wide mode (w); rows carry their cells
+	// after the normal ones.
+	wide []string
 	// drop lists the columns to hide, in order, when the terminal is narrow.
 	drop  []int
 	hints []hint
@@ -73,10 +84,11 @@ var kinds = []*kindDef{
 	{
 		kind: kActors, aliases: []string{"actor", "act", "a"}, scoped: true,
 		columns: []string{"ATESPACE", "NAME", "STATE", "TEMPLATE", "WORKER", "NODE", "GEN", "UPDATED", "AGE"},
+		wide:    []string{"POD", "SANDBOX", "CRASH", "UID"},
 		drop:    []int{6, 5, 7, 3},
-		hints: []hint{{"⏎", "explain"}, {"y", "yaml"}, {"l", "logs"}, {"u", "relations"}, {"e", "egress"},
-			{"E", "events"}, {"T", "timeline"}, {"o", "worker"}, {"t", "template"}, {"␣", "mark"},
-			{"s", "suspend"}, {"R", "resume"}, {"v", "revert"}, {"^d", "delete"}},
+		hints: []hint{{"enter", "explain"}, {"y", "yaml"}, {"l", "logs"}, {"u", "relations"}, {"e", "egress"},
+			{"E", "events"}, {"T", "timeline"}, {"o", "worker"}, {"t", "template"}, {"f", "proxy"}, {" ", "mark"},
+			{"s", "suspend"}, {"R", "resume"}, {"v", "revert"}, {"ctrl+d", "delete"}},
 		fetch: func(ctx context.Context, b Backend, scope string, now time.Time) ([]row, error) {
 			as, err := b.ListActors(ctx, scope)
 			if err != nil {
@@ -92,9 +104,10 @@ var kinds = []*kindDef{
 	{
 		kind: kWorkers, aliases: []string{"worker", "wk", "w"},
 		columns: []string{"NAME", "STATE", "POOL", "NODE", "ACTORS", "CPU", "MEM", "POD", "AGE"},
+		wide:    []string{"NAMESPACE", "EPOCHS", "LABELS", "UID"},
 		drop:    []int{7, 6, 5, 3},
-		hints: []hint{{"⏎", "assignments"}, {"y", "yaml"}, {"X", "explain"}, {"u", "relations"},
-			{"E", "events"}, {"p", "pool"}, {"␣", "mark"}, {"D", "drain"}, {"A", "available"},
+		hints: []hint{{"enter", "assignments"}, {"y", "yaml"}, {"X", "explain"}, {"u", "relations"},
+			{"E", "events"}, {"p", "pool"}, {" ", "mark"}, {"D", "drain"}, {"A", "available"},
 			{"U", "unavailable"}},
 		fetch: func(ctx context.Context, b Backend, _ string, now time.Time) ([]row, error) {
 			ws, err := b.ListWorkers(ctx)
@@ -111,8 +124,9 @@ var kinds = []*kindDef{
 	{
 		kind: kTemplates, aliases: []string{"template", "actortemplates", "actortemplate", "tpl"}, scoped: true,
 		columns: []string{"ATESPACE", "NAME", "IMAGES", "CPU", "MEM", "GOLDEN", "AGE"},
+		wide:    []string{"GOLDEN ERROR", "UID"},
 		drop:    []int{4, 3, 2},
-		hints:   []hint{{"⏎", "actors"}, {"y", "yaml"}, {"X", "explain"}, {"u", "relations"}},
+		hints:   []hint{{"enter", "actors"}, {"y", "yaml"}, {"X", "explain"}, {"u", "relations"}},
 		fetch: func(ctx context.Context, b Backend, scope string, now time.Time) ([]row, error) {
 			ts, err := b.ListActorTemplates(ctx, scope)
 			if err != nil {
@@ -129,7 +143,7 @@ var kinds = []*kindDef{
 		kind: kAtespaces, aliases: []string{"atespace", "as", "ns"},
 		columns: []string{"NAME", "UID", "AGE"},
 		drop:    []int{1},
-		hints:   []hint{{"⏎", "actors"}, {"y", "yaml"}, {"u", "relations"}},
+		hints:   []hint{{"enter", "actors"}, {"y", "yaml"}, {"u", "relations"}},
 		fetch: func(ctx context.Context, b Backend, _ string, now time.Time) ([]row, error) {
 			as, err := b.ListAtespaces(ctx)
 			if err != nil {
@@ -148,6 +162,7 @@ var kinds = []*kindDef{
 	{
 		kind: kTags, aliases: []string{"tag"}, scoped: true,
 		columns: []string{"ATESPACE", "NAME", "SCOPE", "SOURCE", "GEN", "FIDELITY", "AGE"},
+		wide:    []string{"UID"},
 		drop:    []int{5, 3},
 		hints:   []hint{{"y", "yaml"}, {"u", "relations"}},
 		fetch: func(ctx context.Context, b Backend, scope string, now time.Time) ([]row, error) {
@@ -166,6 +181,7 @@ var kinds = []*kindDef{
 					fmt.Sprint(snap.GetGeneration()),
 					enumTitle(snap.GetFidelity().String(), "SNAPSHOT_FIDELITY_"),
 					age(md.GetCreateTime().AsTime(), now),
+					md.GetUid(),
 				}, map[int]string{6: sortTime(md.GetCreateTime().AsTime())}))
 			}
 			return rows, nil
@@ -174,8 +190,9 @@ var kinds = []*kindDef{
 	{
 		kind: kWorkerPools, aliases: []string{"workerpool", "wp", "pools", "pool"},
 		columns: []string{"NAMESPACE", "NAME", "DESIRED", "CURRENT", "READY", "SANDBOX", "AGE"},
+		wide:    []string{"IMAGE"},
 		drop:    []int{3, 2, 5},
-		hints:   []hint{{"⏎", "workers"}, {"y", "yaml"}, {"X", "explain"}, {"u", "relations"}},
+		hints:   []hint{{"enter", "workers"}, {"y", "yaml"}, {"X", "explain"}, {"u", "relations"}},
 		fetch: func(ctx context.Context, b Backend, _ string, now time.Time) ([]row, error) {
 			ps, err := b.ListWorkerPools(ctx)
 			if err != nil {
@@ -191,7 +208,8 @@ var kinds = []*kindDef{
 	{
 		kind: kAssignments, aliases: []string{"assignment"},
 		columns: []string{"ATESPACE", "ACTOR", "CPU", "MEM", "AGE"},
-		hints:   []hint{{"⏎", "actor"}, {"y", "yaml"}, {"u", "relations"}},
+		wide:    []string{"UID"},
+		hints:   []hint{{"enter", "actor"}, {"y", "yaml"}, {"u", "relations"}},
 		fetch: func(ctx context.Context, b Backend, worker string, now time.Time) ([]row, error) {
 			if worker == "" {
 				return nil, fmt.Errorf("pick a worker and press ⏎ to list its assignments")
@@ -208,6 +226,7 @@ var kinds = []*kindDef{
 					explain.Millicores(a.GetResources().GetCpuMillicores()),
 					explain.Bytes(a.GetResources().GetMemoryBytes()),
 					age(md.GetCreateTime().AsTime(), now),
+					dash(md.GetUid()),
 				}, map[int]string{4: sortTime(md.GetCreateTime().AsTime())}))
 			}
 			return rows, nil
@@ -260,6 +279,10 @@ func actorRow(a *ateapi.Actor, now time.Time) row {
 		gen,
 		age(md.GetUpdateTime().AsTime(), now),
 		age(md.GetCreateTime().AsTime(), now),
+		dash(st.GetWorkerAssignment().GetWorkerPod()),
+		dash(st.GetWorkerAssignment().GetSandboxRuntime().GetSandboxClass()),
+		dash(oneLine(st.GetCrash().GetMessage())),
+		dash(md.GetUid()),
 	}, map[int]string{
 		7: sortTime(md.GetUpdateTime().AsTime()),
 		8: sortTime(md.GetCreateTime().AsTime()),
@@ -290,6 +313,10 @@ func workerRow(w *ateapi.Worker, now time.Time) row {
 		explain.Bytes(st.GetAllocated().GetMemoryBytes()) + "/" + explain.Bytes(st.GetCapacity().GetMemoryBytes()),
 		dash(w.GetWorkerPod()),
 		age(md.GetCreateTime().AsTime(), now),
+		dash(w.GetWorkerNamespace()),
+		fmt.Sprintf("%d/%d/%d", st.GetIssuedEpoch(), st.GetRegisteredEpoch(), st.GetObservedEpoch()),
+		dash(labelString(w.GetLabels())),
+		dash(md.GetUid()),
 	}, map[int]string{
 		4: fmt.Sprintf("%010d", used),
 		8: sortTime(md.GetCreateTime().AsTime()),
@@ -315,6 +342,7 @@ func templateRow(t *ateapi.ActorTemplate, now time.Time) row {
 		md.GetAtespace(), md.GetName(), dash(strings.Join(imgs, ",")),
 		explain.Millicores(lim.GetCpuMillicores()), explain.Bytes(lim.GetMemoryBytes()),
 		golden, age(md.GetCreateTime().AsTime(), now),
+		dash(oneLine(gs.GetErrorMessage())), dash(md.GetUid()),
 	}, map[int]string{6: sortTime(md.GetCreateTime().AsTime())})
 }
 
@@ -339,6 +367,7 @@ func poolRow(p *infrav1.WorkerPool, now time.Time) row {
 		fmt.Sprint(p.Spec.Replicas), fmt.Sprint(p.Status.Replicas), fmt.Sprint(p.Status.ReadyReplicas),
 		dash(strings.Join(classes, ",")),
 		age(p.CreationTimestamp.Time, now),
+		dash(p.Spec.WorkerImage),
 	}, map[int]string{
 		2: fmt.Sprintf("%010d", p.Spec.Replicas),
 		3: fmt.Sprintf("%010d", p.Status.Replicas),
@@ -351,6 +380,24 @@ func age(t, now time.Time) string { return explain.Age(t, now) }
 
 // sortTime sorts newest first under an ascending sort, like kubectl AGE.
 func sortTime(t time.Time) string { return fmt.Sprintf("%020d", 1<<62-t.UnixNano()) }
+
+// oneLine keeps the first line of a message for a table cell.
+func oneLine(s string) string {
+	s, _, _ = strings.Cut(strings.TrimSpace(s), "\n")
+	return s
+}
+
+func labelString(l map[string]string) string {
+	keys := make([]string, 0, len(l))
+	for k := range l {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for i, k := range keys {
+		keys[i] = k + "=" + l[k]
+	}
+	return strings.Join(keys, ",")
+}
 
 func dash(s string) string {
 	if s == "" {
@@ -366,3 +413,6 @@ func enumTitle(s, prefix string) string {
 	}
 	return s[:1] + strings.ToLower(s[1:])
 }
+
+// ValidKind reports whether name is a kind or one of its aliases.
+func ValidKind(name string) bool { return lookupKind(name) != nil }

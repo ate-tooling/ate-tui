@@ -13,7 +13,9 @@ import (
 	"crypto/x509"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
+	"sync"
 
 	ateapi "go.ate.dev/substrate/api/ateapi/v1"
 	atev1 "go.ate.dev/substrate/pkg/client/clientset/versioned"
@@ -74,8 +76,12 @@ type Conn struct {
 	Host     string
 	Endpoint string
 
+	config      *rest.Config
 	grpcConn    *grpc.ClientConn
 	stopForward func()
+
+	routerMu     sync.Mutex
+	routerDialer *routerDialer
 }
 
 // Close tears down the gRPC connection and the port-forward.
@@ -86,6 +92,32 @@ func (c *Conn) Close() {
 	if c.stopForward != nil {
 		c.stopForward()
 	}
+}
+
+// KubeContext is one context in the kubeconfig.
+type KubeContext struct {
+	Name, Server string
+	Current      bool
+}
+
+// Contexts lists the kubeconfig's contexts, sorted by name.
+func Contexts(kubeconfig string) ([]KubeContext, error) {
+	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+	loadingRules.ExplicitPath = kubeconfig
+	raw, err := loadingRules.Load()
+	if err != nil {
+		return nil, fmt.Errorf("load kubeconfig: %w", err)
+	}
+	out := make([]KubeContext, 0, len(raw.Contexts))
+	for name, c := range raw.Contexts {
+		kc := KubeContext{Name: name, Current: name == raw.CurrentContext}
+		if cl := raw.Clusters[c.Cluster]; cl != nil {
+			kc.Server = cl.Server
+		}
+		out = append(out, kc)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
 }
 
 // Connect dials ateapi.
@@ -113,7 +145,7 @@ func Connect(ctx context.Context, opts Options) (*Conn, error) {
 		return nil, fmt.Errorf("create ate.dev client: %w", err)
 	}
 
-	conn := &Conn{Kube: kc, Ate: ac, Host: config.Host, Context: opts.Context}
+	conn := &Conn{Kube: kc, Ate: ac, Host: config.Host, Context: opts.Context, config: config}
 	if conn.Context == "" {
 		conn.Context = raw.CurrentContext
 	}

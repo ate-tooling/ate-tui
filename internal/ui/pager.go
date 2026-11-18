@@ -33,6 +33,10 @@ type pager struct {
 	// items make the pager a list with a cursor (relations); nil otherwise.
 	items  []relation
 	cursor int
+	// forwards makes the pager the :pf list, drawn from Model.forwards;
+	// contexts the :ctx list.
+	forwards bool
+	contexts bool
 }
 
 type pagerMsg struct {
@@ -230,19 +234,11 @@ func buildReport(ctx context.Context, b Backend, obj any) (explain.Report, error
 	return explain.Report{}, fmt.Errorf("explain is not available for %T", obj)
 }
 
-var levelGlyph = map[explain.Level]string{
-	explain.OK:    fg(cGreen).Render("✔"),
-	explain.Info:  fg(cSky).Render("•"),
-	explain.Warn:  fg(cPeach).Render("▲"),
-	explain.Error: fg(cRed).Render("✖"),
-}
-
-var levelStyle = map[explain.Level]func(...string) string{
-	explain.OK:    fg(cGreen).Render,
-	explain.Info:  fg(cText).Render,
-	explain.Warn:  fg(cPeach).Render,
-	explain.Error: fg(cRed).Render,
-}
+// levelGlyph and levelStyle are set by ApplySkin.
+var (
+	levelGlyph map[explain.Level]string
+	levelStyle map[explain.Level]func(...string) string
+)
 
 func renderReport(r explain.Report) []string {
 	var out []string
@@ -328,6 +324,9 @@ func (m *Model) openHelp() {
 			{"ctrl-z", "toggle faults only (crashed, stuck, draining, not ready)"},
 			{"S / I", "cycle sort column / invert"},
 			{"r", "refresh now (or reconnect)"},
+			{":ctx [name]", "switch kube context and reconnect; :ctx alone lists them"},
+			{"w", "wide: extra columns (pod, sandbox, crash, uid, …), none hidden"},
+			{"c", "copy the row's name, or a pager's text (C in logs), with OSC 52"},
 			{"q, ctrl-c", "quit"},
 		}},
 		{"Actors", []hint{
@@ -355,6 +354,10 @@ func (m *Model) openHelp() {
 			{":pulse", "cluster overview: actor states, slots, pools, crashes, stuck, golden errors"},
 			{":access", "global and atespace access policy bindings (no permission prediction)"},
 		}},
+		{"Proxy (needs --write or writeContexts; resumes a suspended actor)", []hint{
+			{"f", "actor: forward local ports through atenet-router, like kubectl ate proxy actor"},
+			{":pf", "list forwards with connections and bytes; ⏎ actor, ctrl-d stop"},
+		}},
 		{"Actions (need --write or writeContexts in the config)", []hint{
 			{"space", "mark / unmark a row; actions apply to marked rows, or the current one"},
 			{"s", "actor: suspend (tab in the dialog: async or sync durability)"},
@@ -365,6 +368,12 @@ func (m *Model) openHelp() {
 			{"A / U", "worker: mark available / unavailable"},
 			{":journal", "actions and results, this session and earlier"},
 		}},
+	}
+	if c := m.keys.custom(); len(c) > 0 {
+		sections = append([]struct {
+			name  string
+			hints []hint
+		}{{"Rebound in config.yaml (the tables below show the defaults)", c}}, sections...)
 	}
 	var lines []string
 	for _, s := range sections {

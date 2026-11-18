@@ -47,3 +47,54 @@ func TestXDGPaths(t *testing.T) {
 		t.Errorf("JournalPath = %s", got)
 	}
 }
+
+func TestLoadFullConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := `refresh: 5s
+defaultView: workers
+atespace: research
+skin: catppuccin-latte
+colors:
+  red: "#ff0000"
+keys:
+  suspend: S
+  sort: ctrl+s
+mouse: false
+proxyAddress: 0.0.0.0
+writeContexts: [kind-dev]
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, _ := c.RefreshInterval()
+	if d.String() != "5s" || c.DefaultView != "workers" || c.Atespace != "research" || c.Skin != "catppuccin-latte" ||
+		c.Colors.Red != "#ff0000" || c.Keys["suspend"] != "S" || c.MouseEnabled() || c.ProxyAddress != "0.0.0.0" {
+		t.Errorf("config %+v", c)
+	}
+	if !(Config{}).MouseEnabled() {
+		t.Error("mouse is off by default")
+	}
+}
+
+func TestLoadRejectsBadValues(t *testing.T) {
+	dir := t.TempDir()
+	for name, body := range map[string]string{
+		"refresh-typo":  "refresh: 5 seconds\n",
+		"refresh-small": "refresh: 10ms\n",
+		"proxy-host":    "proxyAddress: example.com\n",
+		"color-typo":    "colors: {rouge: \"#ff0000\"}\n",
+		"bare-bool-key": "keys: {yaml: Y}\n",
+	} {
+		path := filepath.Join(dir, name+".yaml")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err == nil {
+			t.Errorf("%s: no error", name)
+		}
+	}
+}
