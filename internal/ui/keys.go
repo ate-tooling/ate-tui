@@ -229,6 +229,13 @@ func (m *Model) keyRow(key string, r *row) tea.Cmd {
 			return m.gotoKind(kAssignments, "")
 		case "p":
 			return m.gotoKind(kWorkerPools, o.GetWorkerPool())
+		case "l":
+			if o.GetWorkerPod() == "" {
+				m.setStatus("worker has no pod", true)
+				return nil
+			}
+			m.worker = o.GetMetadata().GetName()
+			return m.gotoKind(kHistory, "")
 		case "E":
 			if o.GetWorkerPod() == "" {
 				m.setStatus("worker has no pod", true)
@@ -248,6 +255,10 @@ func (m *Model) keyRow(key string, r *row) tea.Cmd {
 	case *infrav1.WorkerPool:
 		if key == "enter" {
 			return m.gotoKind(kWorkers, o.Name)
+		}
+	case *keptActor:
+		if key == "enter" {
+			return m.openKept(o)
 		}
 	case *ateapi.ActorAssignment:
 		if key == "enter" {
@@ -277,7 +288,7 @@ func (m *Model) historyMove(step int) tea.Cmd {
 	}
 	m.histIdx = i
 	k := m.history[i]
-	if k.kind == kAssignments {
+	if workerScoped(k.kind) {
 		m.worker = k.scope
 	} else if lookupKind(string(k.kind)).scoped {
 		m.atespace = k.scope

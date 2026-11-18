@@ -133,7 +133,10 @@ type logStream struct {
 	waiting   bool
 	waitState ateapi.ActorState
 	polling   bool
-	lastErr   string
+	// kept reads what one pod kept for the actor once, without following
+	// it: the actor may be gone, or living elsewhere.
+	kept    bool
+	lastErr string
 
 	entries []logLine
 	seq     int
@@ -215,7 +218,7 @@ func (m *Model) openLogs(a *ateapi.Actor) tea.Cmd {
 // pollLogActor reads the actor for the follow loop, one call at a time.
 func (m *Model) pollLogActor() tea.Cmd {
 	s := m.logs
-	if s == nil || s.polling || m.backend == nil {
+	if s == nil || s.kept || s.polling || m.backend == nil {
 		return nil
 	}
 	s.polling = true
@@ -237,6 +240,9 @@ func (m *Model) logActor(msg logActorMsg) tea.Cmd {
 	if msg.err != nil {
 		if status.Code(msg.err) == codes.NotFound {
 			s.stop()
+			if s.lastPod != "" {
+				return m.keepDeleted()
+			}
 		}
 		m.appendLogs([]logLine{logError("get actor: " + errString(msg.err))})
 		return nil
@@ -276,29 +282,54 @@ func (m *Model) observeActor(a *ateapi.Actor) tea.Cmd {
 	return m.startStream(ns, pod, switched)
 }
 
+// keepDeleted turns the pager to what the last pod kept once the actor is
+// deleted: one read from the cursor picks up its last lines, and the pager
+// stays open on them.
+func (m *Model) keepDeleted() tea.Cmd {
+	s := m.logs
+	s.kept, s.waiting = true, false
+	m.appendLogs([]logLine{notice("── actor deleted; showing what " + s.lastPod + " kept ──")})
+	ns, pod, _ := strings.Cut(s.lastPod, "/")
+	return m.startStream(ns, pod, false)
+}
+
 func (m *Model) startStream(ns, pod string, switched bool) tea.Cmd {
 	s := m.logs
 	// The kubelet's own timestamp on each line is the cursor: SinceTime is
 	// compared against it, and it does not depend on the actor's clock.
-	opts := &corev1.PodLogOptions{Follow: true, Timestamps: true}
+	opts := &corev1.PodLogOptions{Follow: !s.kept, Timestamps: true}
 	if s.cursor.IsZero() {
 		tail := int64(logTail)
 		opts.TailLines = &tail
 	} else {
 		opts.SinceTime = &metav1.Time{Time: s.cursor}
 	}
+	// SinceTime has second precision, so a reconnect to the same pod
+	// re-reads the cursor's second. Another pod's lines are all new, and
+	// its node's clock is not this one's, so they are not compared.
+	var after time.Time
+	if !switched {
+		after = s.cursor
+	}
+	return m.runStream(ns, pod, opts, after, time.Time{})
+}
+
+// runStream reads ns/pod's lines for the actor stamped after after and, if
+// until is set, not after until.
+func (m *Model) runStream(ns, pod string, opts *corev1.PodLogOptions, after, until time.Time) tea.Cmd {
+	s := m.logs
 	ctx, cancel := context.WithCancel(context.Background())
 	m.gen++
 	s.stream, s.cancel, s.ns, s.pod = m.gen, cancel, ns, pod
 	s.ch = make(chan logLine, 4096)
-	go streamLogs(ctx, m.backend, ns, pod, opts, s.ref, switched, s.cursor, s.ch)
+	go streamLogs(ctx, m.backend, ns, pod, opts, s.ref, after, until, s.ch)
 	return waitLines(s.ch, s.gen, s.stream)
 }
 
 // streamLogs reads one pod's lines for one actor until the stream ends or
-// ctx is cancelled.
+// ctx is cancelled. A line without a kubelet timestamp is always kept.
 func streamLogs(ctx context.Context, b Backend, ns, pod string, opts *corev1.PodLogOptions,
-	ref *ateapi.ObjectRef, switched bool, cursor time.Time, ch chan<- logLine) {
+	ref *ateapi.ObjectRef, after, until time.Time, ch chan<- logLine) {
 	defer close(ch)
 	send := func(l logLine) bool {
 		select {
@@ -320,10 +351,7 @@ func streamLogs(ctx context.Context, b Backend, ns, pod string, opts *corev1.Pod
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
 		stamp, line, ok := splitKubeletTimestamp(sc.Bytes())
-		// SinceTime has second precision, so a reconnect to the same pod
-		// re-reads the cursor's second. Another pod's lines are all new,
-		// and its node's clock is not this one's, so they are not compared.
-		if ok && !switched && !stamp.After(cursor) {
+		if ok && (!stamp.After(after) || !until.IsZero() && stamp.After(until)) {
 			continue
 		}
 		l, ok := formatLogLine(line, ref.GetAtespace(), ref.GetName())
@@ -562,6 +590,8 @@ func (m *Model) logTitle() string {
 	s := m.logs
 	t := m.pager.title
 	switch {
+	case s.kept:
+		t += stDim.Render("  kept by " + s.ns + "/" + s.pod)
 	case s.stream != 0:
 		t += stDim.Render("  " + s.ns + "/" + s.pod)
 	case s.waiting:
@@ -592,24 +622,11 @@ const (
 // formatLogLine keeps lines the worker attributes to this actor. A worker pod
 // can host several actors over time, so lines must match both labels.
 func formatLogLine(b []byte, atespace, name string) (logLine, bool) {
-	var m map[string]any
-	if json.Unmarshal(b, &m) != nil {
-		return logLine{}, false
-	}
-	var labels map[string]any
-	for _, k := range []string{"logging.googleapis.com/labels", "labels"} {
-		if l, ok := m[k].(map[string]any); ok {
-			labels = l
-			break
-		}
-	}
-	if labels[labelActor] != name || labels[labelAtespace] != atespace {
+	m, labels, ok := parseWorkerLine(b)
+	if !ok || labels[labelActor] != name || labels[labelAtespace] != atespace {
 		return logLine{}, false
 	}
 	container, _ := labels[labelContainer].(string)
-	if container == sandboxID {
-		return logLine{}, false
-	}
 	msg, _ := m["message"].(string)
 	if msg == "" {
 		msg, _ = m["msg"].(string)
@@ -628,4 +645,22 @@ func formatLogLine(b []byte, atespace, name string) (logLine, bool) {
 		kind, src = lineContainer, stLogContainer.Render(container)
 	}
 	return newLogLine(kind, stLogTime.Render(ts)+" "+src+" ", msg, false), true
+}
+
+// parseWorkerLine decodes a worker JSON line and its labels. ok is false
+// for other output and for the sandbox's own lines.
+func parseWorkerLine(b []byte) (m, labels map[string]any, ok bool) {
+	if json.Unmarshal(b, &m) != nil {
+		return nil, nil, false
+	}
+	for _, k := range []string{"logging.googleapis.com/labels", "labels"} {
+		if l, ok := m[k].(map[string]any); ok {
+			labels = l
+			break
+		}
+	}
+	if labels[labelContainer] == sandboxID {
+		return nil, nil, false
+	}
+	return m, labels, true
 }

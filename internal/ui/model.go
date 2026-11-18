@@ -116,7 +116,7 @@ type Model struct {
 	history  []viewKey
 	histIdx  int
 	atespace string
-	worker   string // scope of the assignments view
+	worker   string // scope of the assignments and history views
 
 	data   map[viewKey]*dataset
 	tables map[viewKey]*tableState
@@ -217,7 +217,7 @@ func (m *Model) tick() tea.Cmd {
 
 func (m *Model) keyFor(k kind) viewKey {
 	switch {
-	case k == kAssignments:
+	case workerScoped(k):
 		return viewKey{k, m.worker}
 	case lookupKind(string(k)).scoped:
 		return viewKey{k, m.atespace}
@@ -251,6 +251,9 @@ func (m *Model) tableFor(k viewKey) *tableState {
 	t := m.tables[k]
 	if t == nil {
 		t = &tableState{marked: map[string]bool{}}
+		if def := lookupKind(string(k.kind)); def != nil {
+			t.sortCol = def.sortCol
+		}
 		m.tables[k] = t
 	}
 	return t
@@ -435,7 +438,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		cmds := []tea.Cmd{m.tick()}
 		if m.backend != nil {
-			cmds = append(cmds, m.fetch(m.cur))
+			if !m.def().manual {
+				cmds = append(cmds, m.fetch(m.cur))
+			}
 			if m.pager != nil && m.pager.reload != nil && !m.pager.loading {
 				cmds = append(cmds, m.pager.reload())
 			}

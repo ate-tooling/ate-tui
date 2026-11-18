@@ -134,7 +134,7 @@ The header then shows `[write]`. `--demo` allows writes only with `--write`.
 | `⏎` | actor: explain · worker: assignments · template: its actors · atespace: its actors · pool: its workers |
 | `X` | explain (actors, workers, templates, pools) |
 | `y` | yaml |
-| `l` | follow actor logs across worker moves (see [Logs](#logs)) |
+| `l` | actor: follow its logs across worker moves · worker: the actors its pod kept logs for, deleted ones too (see [Logs](#logs)) |
 | `u` | relations of any row; `⏎` jumps to one (see [Diagnosis](#diagnosis)) |
 | `e` | actor: egress policy |
 | `E` | actor or worker: Kubernetes events of the worker pod |
@@ -169,6 +169,22 @@ actor with `GetActor`:
   per state, and reconnects when the actor runs again.
 - A reconnect to the same pod resumes from the kubelet timestamp of the last
   line shown (`Timestamps` and `SinceTime`), so no line appears twice.
+- When the actor is deleted, the pager stays open: one last read from the
+  cursor picks up its final lines from the pod it ran on, and the title says
+  `kept by <ns>/<pod>`. Deleting an actor with `ctrl-d` also records that
+  worker and pod in `:journal`.
+
+`l` on a worker lists every actor its pod has lines for, most recent first,
+with the actor's state now: `Deleted` once it is gone, or `elsewhere` when
+it runs on another pod. A worker pod keeps the lines of every actor it hosted,
+so a deleted actor's logs can still be read there until the pod is recycled
+or the kubelet rotates its log file (the logs API serves only the current
+file). An actor that reuses a deleted one's name gets its own row: lines
+from before its create time are the earlier actor's.
+
+`⏎` on a row shows what the pod kept for that actor, without following it.
+An actor running on that pod now is followed as `l` on the actor would. The
+list reads up to 100,000 lines of the pod's log, so it refreshes on `r` only.
 
 Inside the pager:
 

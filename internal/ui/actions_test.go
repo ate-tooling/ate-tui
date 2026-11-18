@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	ateapi "go.ate.dev/substrate/api/ateapi/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -156,6 +157,24 @@ func TestDeleteNeedsTypedName(t *testing.T) {
 	drive(m, m.fetch(m.cur))
 	if got := cell(m, id, 2); got != "" {
 		t.Fatalf("deleted actor still listed as %s", got)
+	}
+}
+
+func TestDeleteJournalsWorkerPod(t *testing.T) {
+	m := writeModel(t)
+	id := selectState(t, m, 2, "Running")
+	a := m.selected().obj.(*ateapi.Actor)
+	wa := a.GetStatus().GetWorkerAssignment()
+	press(m, "ctrl+d", a.GetMetadata().GetName(), "enter")
+	if len(m.session) != 1 {
+		t.Fatalf("journal %+v", m.session)
+	}
+	e := m.session[0]
+	if e.Object != id || e.Worker != wa.GetWorker().GetName() || e.Pod != wa.GetWorkerNamespace()+"/"+wa.GetWorkerPod() {
+		t.Fatalf("journal entry %+v, want worker %s pod %s", e, wa.GetWorker().GetName(), wa.GetWorkerPod())
+	}
+	if !strings.Contains(strings.Join(m.journalLines(), "\n"), e.Pod) {
+		t.Error(":journal does not show the pod")
 	}
 }
 

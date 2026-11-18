@@ -124,7 +124,9 @@ type (
 		batch int
 		id    string
 		obj   any
-		err   error
+		// target is the row's object the action ran on.
+		target any
+		err    error
 	}
 	repollMsg   struct{ key viewKey }
 	journalMsg  struct{ err error }
@@ -292,7 +294,7 @@ func (m *Model) runAction() tea.Cmd {
 			ctx, cancel := context.WithTimeout(context.Background(), timeout)
 			defer cancel()
 			obj, err := act.run(ctx, b, t.obj, sync)
-			return actionResultMsg{batch: batch, id: t.id, obj: obj, err: err}
+			return actionResultMsg{batch: batch, id: t.id, obj: obj, target: t.obj, err: err}
 		})
 	}
 	return tea.Batch(cmds...)
@@ -319,7 +321,7 @@ func (m *Model) actionResult(msg actionResultMsg) tea.Cmd {
 			m.want = wantRow{key: bt.key, id: msg.id}
 		}
 	}
-	cmds = append(cmds, m.journal(bt, msg.id, msg.err))
+	cmds = append(cmds, m.journal(bt, msg.id, msg.target, msg.err))
 	if bt.done < bt.total {
 		return tea.Batch(cmds...)
 	}

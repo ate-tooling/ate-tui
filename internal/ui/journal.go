@@ -9,6 +9,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	ateapi "go.ate.dev/substrate/api/ateapi/v1"
 )
 
 // journalEntry is one line of journal.jsonl.
@@ -18,8 +19,12 @@ type journalEntry struct {
 	Action  string    `json:"action"`
 	Mode    string    `json:"mode,omitempty"`
 	Object  string    `json:"object"`
-	Result  string    `json:"result"`
-	Error   string    `json:"error,omitempty"`
+	// Worker and Pod are where a deleted actor ran: the pod keeps its
+	// logs, which l on the worker lists.
+	Worker string `json:"worker,omitempty"`
+	Pod    string `json:"pod,omitempty"`
+	Result string `json:"result"`
+	Error  string `json:"error,omitempty"`
 }
 
 // journalMu serializes appends from parallel action results.
@@ -74,8 +79,13 @@ func readJournal(path string) ([]journalEntry, error) {
 }
 
 // journal records an action result.
-func (m *Model) journal(bt *actionBatch, id string, err error) tea.Cmd {
+func (m *Model) journal(bt *actionBatch, id string, target any, err error) tea.Cmd {
 	e := journalEntry{Time: time.Now(), Context: m.info.Context, Action: bt.act.name, Object: id, Result: "ok"}
+	if a, ok := target.(*ateapi.Actor); ok && bt.act.name == "delete" {
+		if wa := a.GetStatus().GetWorkerAssignment(); wa.GetWorkerPod() != "" {
+			e.Worker, e.Pod = wa.GetWorker().GetName(), wa.GetWorkerNamespace()+"/"+wa.GetWorkerPod()
+		}
+	}
 	if bt.act.name == "suspend" {
 		e.Mode = "async"
 		if bt.sync {
@@ -159,9 +169,13 @@ func (m *Model) journalLines() []string {
 		if e.Mode != "" {
 			act += " (" + e.Mode + ")"
 		}
+		where := ""
+		if e.Pod != "" {
+			where = stDim.Render(" on "+dash(e.Worker)+" ("+e.Pod+")") + " "
+		}
 		return stLogTime.Render(e.Time.Local().Format("2006-01-02 15:04:05")) + "  " +
 			stContext.Render(e.Context) + "  " + stResource.Render(act) + "  " +
-			fg(cBlue).Render(e.Object) + "  " + res
+			fg(cBlue).Render(e.Object) + " " + where + " " + res
 	}
 	if len(m.prior) > 0 {
 		out = append(out, stSection.Render("Earlier"))

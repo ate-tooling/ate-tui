@@ -224,6 +224,12 @@ const maxPodLog = 5000
 // emit appends a line in the worker's JSON format to a pod's log. An empty
 // container is a lifecycle line. Callers hold b.mu.
 func (b *Backend) emit(pod string, a *ateapi.Actor, container, msg string) {
+	b.emitAt(time.Now(), pod, a, container, msg)
+}
+
+// emitAt is emit with the line stamped at now, which must not be before
+// the pod's last line.
+func (b *Backend) emitAt(now time.Time, pod string, a *ateapi.Actor, container, msg string) {
 	pl := b.podLogs[pod]
 	if pl == nil {
 		pl = &podLog{}
@@ -233,7 +239,6 @@ func (b *Backend) emit(pod string, a *ateapi.Actor, container, msg string) {
 	if container != "" {
 		c = fmt.Sprintf(`,"ate.actor.container.name":%q`, container)
 	}
-	now := time.Now()
 	pl.seq++
 	pl.recs = append(pl.recs, logRec{seq: pl.seq, at: now, line: fmt.Sprintf(
 		`{"time":%q,"message":%q,"labels":{"ate.atespace":%q,"ate.actor.name":%q%s}}`,
