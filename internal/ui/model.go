@@ -107,6 +107,8 @@ type Model struct {
 	mode          mode
 	keys          Keymap
 	lastClick     time.Time
+	// edit runs the editor on a file; nil runs $EDITOR. Tests set it.
+	edit func(path string, done func(error) tea.Msg) tea.Cmd
 	// wide shows every column and hides none on a narrow terminal (w).
 	wide bool
 
@@ -481,6 +483,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case fwdStoppedMsg:
 		return m, nil
+
+	case editMsg:
+		return m, m.openEditor(msg)
+
+	case editedMsg:
+		return m, m.edited(msg)
+
+	case manifestMsg:
+		return m, m.manifestParsed(msg)
 
 	case copiedMsg:
 		if msg.err != nil {

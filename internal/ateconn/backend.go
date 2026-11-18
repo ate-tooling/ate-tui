@@ -191,3 +191,19 @@ func (c *Conn) MarkWorkerUnavailable(ctx context.Context, name string) (*ateapi.
 	r, err := c.Control.MarkWorkerUnavailable(ctx, &ateapi.MarkWorkerUnavailableRequest{Worker: &ateapi.ObjectRef{Name: name}})
 	return r.GetWorker(), err
 }
+
+func (c *Conn) CreateAtespace(ctx context.Context, a *ateapi.Atespace) (*ateapi.Atespace, error) {
+	return c.Control.CreateAtespace(ctx, &ateapi.CreateAtespaceRequest{Atespace: a})
+}
+
+func (c *Conn) CreateActorTemplate(ctx context.Context, t *ateapi.ActorTemplate) (*ateapi.ActorTemplate, error) {
+	return c.Control.CreateActorTemplate(ctx, &ateapi.CreateActorTemplateRequest{ActorTemplate: t})
+}
+
+func (c *Conn) CreateActor(ctx context.Context, a *ateapi.Actor) (*ateapi.Actor, error) {
+	return c.Control.CreateActor(ctx, &ateapi.CreateActorRequest{Actor: a})
+}
+
+func (c *Conn) CreateTag(ctx context.Context, t *ateapi.Tag) (*ateapi.Tag, error) {
+	return c.Control.CreateTag(ctx, &ateapi.CreateTagRequest{Tag: t})
+}

@@ -103,6 +103,10 @@ func (m *Model) keyTable(key string) tea.Cmd {
 			return m.copy(r.id)
 		}
 		return nil
+	case "n":
+		return m.startCreate(false)
+	case "ctrl+n":
+		return m.startCreate(true)
 	case "/":
 		m.mode, m.input = modeFilter, t.filter
 		return nil

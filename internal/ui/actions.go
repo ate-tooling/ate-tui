@@ -314,6 +314,10 @@ func (m *Model) actionResult(msg actionResultMsg) tea.Cmd {
 		}
 	} else {
 		m.optimistic(bt, msg.id, msg.obj)
+		if bt.act == createAction && bt.key == m.cur {
+			// Land on the new row once the re-poll lists it.
+			m.want = wantRow{key: bt.key, id: msg.id}
+		}
 	}
 	cmds = append(cmds, m.journal(bt, msg.id, msg.err))
 	if bt.done < bt.total {

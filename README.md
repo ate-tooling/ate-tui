@@ -76,7 +76,7 @@ colors:
 
 **Keys.** These actions can be rebound: `quit down up top bottom page-down
 page-up filter command help back forward next-view prev-view all-atespaces
-sort invert faults mark refresh wide copy explain yaml relations logs proxy
+sort invert faults mark refresh wide copy create clone explain yaml relations logs proxy
 egress events timeline worker template pool suspend resume revert delete
 drain available unavailable`. A key is one character, `ctrl+x`, `alt+x`,
 `tab`, `f1`–`f12`, or `space`. A rebound action's old key does nothing. Two
@@ -138,6 +138,8 @@ The header then shows `[write]`. `--demo` allows writes only with `--write`.
 | `R` | actor: resume |
 | `v` | actor: revert to its durable snapshot (clears a crash) |
 | `ctrl-d` | actor: delete (type the name to confirm) |
+| `n` | atespaces, templates, actors, tags: create from a manifest in `$EDITOR` (see [Create](#create)) |
+| `ctrl-n` | create a copy of the selected atespace, template, actor or tag |
 | `D` | worker: drain (one-way) |
 | `A` / `U` | worker: mark available / unavailable |
 | `?` | help |
@@ -221,6 +223,25 @@ the journal. Quitting closes every forward.
 
 In `--demo`, each forward reaches a small HTTP server that says which actor
 answered: `curl localhost:8000`.
+
+## Create
+
+`n` in the atespaces, templates, actors or tags view opens `$VISUAL`, or
+`$EDITOR`, or `vi`, on a starter manifest. The manifest is filled in from the
+current atespace and the selected row: an actor starts from the selected
+template, and a tag from the selected actor. `ctrl-n` opens a copy of the
+selected object without the fields the server sets (uid, version, times,
+status), with `-copy` added to its name.
+
+A manifest is the resource message as protojson-shaped YAML. That is the
+format `kubectl ate create actor-template -f` reads and `y` shows, so you
+can paste from either. Parsing is strict: an unknown field or a missing name,
+atespace, container image, template or source actor reopens the editor with
+the error at the top. Quitting with the file unchanged, or emptied, cancels.
+A good manifest goes through the usual confirm dialog. Creating needs
+`--write` or a `writeContexts` entry, and it is journaled. The cursor then
+lands on the new row. Templates are immutable, so to change one, delete it
+and create it again.
 
 ## Explain
 

@@ -49,15 +49,15 @@ func TestParseKeymap(t *testing.T) {
 
 func TestReboundKeysDriveTheTable(t *testing.T) {
 	m := demoModel(t, 160, 40)
-	km, err := ParseKeymap(map[string]string{"yaml": "Y", "down": "n"})
+	km, err := ParseKeymap(map[string]string{"yaml": "Y", "down": "J"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	m.keys = km
 	before := m.table().cursor
-	press(m, "n")
+	press(m, "J")
 	if m.table().cursor != before+1 {
-		t.Errorf("n did not move down")
+		t.Errorf("J did not move down")
 	}
 	press(m, "y")
 	if m.mode != modeTable {

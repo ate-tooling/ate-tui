@@ -46,6 +46,11 @@ type Backend interface {
 	DrainWorker(ctx context.Context, name string) (*ateapi.Worker, error)
 	MarkWorkerAvailable(ctx context.Context, name string) (*ateapi.Worker, error)
 	MarkWorkerUnavailable(ctx context.Context, name string) (*ateapi.Worker, error)
+
+	CreateAtespace(ctx context.Context, a *ateapi.Atespace) (*ateapi.Atespace, error)
+	CreateActorTemplate(ctx context.Context, t *ateapi.ActorTemplate) (*ateapi.ActorTemplate, error)
+	CreateActor(ctx context.Context, a *ateapi.Actor) (*ateapi.Actor, error)
+	CreateTag(ctx context.Context, t *ateapi.Tag) (*ateapi.Tag, error)
 }
 
 type kind string
@@ -87,7 +92,7 @@ var kinds = []*kindDef{
 		wide:    []string{"POD", "SANDBOX", "CRASH", "UID"},
 		drop:    []int{6, 5, 7, 3},
 		hints: []hint{{"enter", "explain"}, {"y", "yaml"}, {"l", "logs"}, {"u", "relations"}, {"e", "egress"},
-			{"E", "events"}, {"T", "timeline"}, {"o", "worker"}, {"t", "template"}, {"f", "proxy"}, {" ", "mark"},
+			{"E", "events"}, {"T", "timeline"}, {"o", "worker"}, {"t", "template"}, {"f", "proxy"}, {"n", "new"}, {"ctrl+n", "clone"}, {" ", "mark"},
 			{"s", "suspend"}, {"R", "resume"}, {"v", "revert"}, {"ctrl+d", "delete"}},
 		fetch: func(ctx context.Context, b Backend, scope string, now time.Time) ([]row, error) {
 			as, err := b.ListActors(ctx, scope)
@@ -126,7 +131,7 @@ var kinds = []*kindDef{
 		columns: []string{"ATESPACE", "NAME", "IMAGES", "CPU", "MEM", "GOLDEN", "AGE"},
 		wide:    []string{"GOLDEN ERROR", "UID"},
 		drop:    []int{4, 3, 2},
-		hints:   []hint{{"enter", "actors"}, {"y", "yaml"}, {"X", "explain"}, {"u", "relations"}},
+		hints:   []hint{{"enter", "actors"}, {"y", "yaml"}, {"X", "explain"}, {"u", "relations"}, {"n", "new"}, {"ctrl+n", "clone"}},
 		fetch: func(ctx context.Context, b Backend, scope string, now time.Time) ([]row, error) {
 			ts, err := b.ListActorTemplates(ctx, scope)
 			if err != nil {
@@ -143,7 +148,7 @@ var kinds = []*kindDef{
 		kind: kAtespaces, aliases: []string{"atespace", "as", "ns"},
 		columns: []string{"NAME", "UID", "AGE"},
 		drop:    []int{1},
-		hints:   []hint{{"enter", "actors"}, {"y", "yaml"}, {"u", "relations"}},
+		hints:   []hint{{"enter", "actors"}, {"y", "yaml"}, {"u", "relations"}, {"n", "new"}},
 		fetch: func(ctx context.Context, b Backend, _ string, now time.Time) ([]row, error) {
 			as, err := b.ListAtespaces(ctx)
 			if err != nil {
@@ -164,7 +169,7 @@ var kinds = []*kindDef{
 		columns: []string{"ATESPACE", "NAME", "SCOPE", "SOURCE", "GEN", "FIDELITY", "AGE"},
 		wide:    []string{"UID"},
 		drop:    []int{5, 3},
-		hints:   []hint{{"y", "yaml"}, {"u", "relations"}},
+		hints:   []hint{{"y", "yaml"}, {"u", "relations"}, {"n", "new"}, {"ctrl+n", "clone"}},
 		fetch: func(ctx context.Context, b Backend, scope string, now time.Time) ([]row, error) {
 			ts, err := b.ListTags(ctx, scope)
 			if err != nil {

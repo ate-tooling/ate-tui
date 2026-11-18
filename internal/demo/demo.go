@@ -26,6 +26,9 @@ type Backend struct {
 	actors    []*ateapi.Actor
 	workers   []*ateapi.Worker
 	pools     []infrav1.WorkerPool
+	// tags are the ones created through CreateTag; golden tags come from
+	// the templates.
+	tags []*ateapi.Tag
 	// pinned actors keep their demo state; step never moves them.
 	pinned map[*ateapi.Actor]bool
 	// pending counts the polls left before a transition started by a write
@@ -333,6 +336,11 @@ func (b *Backend) ListTags(_ context.Context, atespace string) ([]*ateapi.Tag, e
 				Scope:    ateapi.TagScope_TAG_SCOPE_ATESPACE,
 				Status:   &ateapi.TagStatus{Snapshot: &ateapi.Snapshot{Generation: 1, Fidelity: ateapi.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY}},
 			})
+		}
+	}
+	for _, t := range b.tags {
+		if atespace == "" || t.Metadata.Atespace == atespace {
+			out = append(out, proto.Clone(t).(*ateapi.Tag))
 		}
 	}
 	return out, nil

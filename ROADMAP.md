@@ -43,6 +43,7 @@ in config, and every write asks for confirmation.
 - Wide mode (`w`), OSC52 copy, mouse support.
 - goreleaser, Homebrew tap, Nix flake.
 
-## Later
+## Done later
 
-- Create atespaces, templates, actors and tags from YAML in `$EDITOR`.
+- Create atespaces, templates, actors and tags from YAML in `$EDITOR` (`n`,
+  and `ctrl-n` to clone the selected one).

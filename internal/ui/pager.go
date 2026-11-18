@@ -366,6 +366,8 @@ func (m *Model) openHelp() {
 			{"ctrl-d", "actor: delete; type the name (or yes for several) to confirm"},
 			{"D", "worker: drain (one-way)"},
 			{"A / U", "worker: mark available / unavailable"},
+			{"n", "atespace, template, actor or tag: create from a manifest in $EDITOR"},
+			{"ctrl-n", "create a copy of the selected object (server fields removed)"},
 			{":journal", "actions and results, this session and earlier"},
 		}},
 	}

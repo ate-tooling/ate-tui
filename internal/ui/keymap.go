@@ -14,7 +14,7 @@ var defaultKeys = []struct{ name, key string }{
 	{"page-down", "ctrl+f"}, {"page-up", "ctrl+b"}, {"filter", "/"}, {"command", ":"}, {"help", "?"},
 	{"back", "["}, {"forward", "]"}, {"next-view", "tab"}, {"prev-view", "shift+tab"},
 	{"all-atespaces", "0"}, {"sort", "S"}, {"invert", "I"}, {"faults", "ctrl+z"}, {"mark", " "},
-	{"refresh", "r"}, {"wide", "w"}, {"copy", "c"},
+	{"refresh", "r"}, {"wide", "w"}, {"copy", "c"}, {"create", "n"}, {"clone", "ctrl+n"},
 	{"explain", "X"}, {"yaml", "y"}, {"relations", "u"}, {"logs", "l"}, {"proxy", "f"},
 	{"egress", "e"}, {"events", "E"}, {"timeline", "T"}, {"worker", "o"}, {"template", "t"}, {"pool", "p"},
 	{"suspend", "s"}, {"resume", "R"}, {"revert", "v"}, {"delete", "ctrl+d"},
