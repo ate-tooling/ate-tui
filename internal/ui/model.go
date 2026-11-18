@@ -1,0 +1,456 @@
+// Package ui is the Bubble Tea front end. Every network call runs in a
+// tea.Cmd; Update only touches in-memory state, so keys never wait on I/O.
+// Lists are cached per view and shown immediately on revisit while a
+// background refresh runs (stale-while-revalidate).
+package ui
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+)
+
+// ConnInfo describes the connected cluster for the header.
+type ConnInfo struct {
+	Context  string
+	Cluster  string
+	Endpoint string
+}
+
+// Options configures the UI.
+type Options struct {
+	// Connect runs in the background after the first frame is drawn.
+	Connect   func(ctx context.Context) (Backend, ConnInfo, error)
+	Refresh   time.Duration
+	Version   string
+	Kind      string
+	Atespace  string
+	Filter    string
+	ConnLabel string
+
+	// Write enables writes on any context; WriteContexts enables them on
+	// the listed kube contexts only. Otherwise ate-tui is read-only.
+	Write         bool
+	WriteContexts []string
+	// ConfigPath is shown in the read-only hint.
+	ConfigPath string
+	// JournalPath is where action results are appended; empty disables it.
+	JournalPath string
+}
+
+type mode int
+
+const (
+	modeTable mode = iota
+	modeFilter
+	modeCommand
+	modePager
+	modeConfirm
+)
+
+type viewKey struct {
+	kind  kind
+	scope string
+}
+
+type (
+	connectedMsg struct {
+		backend Backend
+		info    ConnInfo
+		err     error
+	}
+	fetchedMsg struct {
+		key  viewKey
+		gen  int
+		rows []row
+		err  error
+		at   time.Time
+	}
+	tickMsg time.Time
+)
+
+// Model is the root Bubble Tea model.
+type Model struct {
+	opts Options
+
+	backend    Backend
+	info       ConnInfo
+	connErr    error
+	connecting bool
+
+	width, height int
+	mode          mode
+
+	cur      viewKey
+	history  []viewKey
+	histIdx  int
+	atespace string
+	worker   string // scope of the assignments view
+
+	data   map[viewKey]*dataset
+	tables map[viewKey]*tableState
+	gen    int
+
+	input       string
+	suggestions []string
+	suggestIdx  int
+
+	pager *pager
+	logs  *logStream
+
+	timeline  []tlEvent
+	lastState map[string]string
+
+	status    string
+	statusErr bool
+	// fetchErr is set while the status shows a list error, which the next
+	// good list clears. Action results stay until the next status.
+	fetchErr bool
+
+	confirm *confirm
+	batches map[int]*actionBatch
+	repoll  time.Duration
+
+	started       time.Time
+	session       []journalEntry
+	prior         []journalEntry
+	journalLoaded bool
+	journalErr    error
+}
+
+// New builds the model. Nothing touches the network until Init's commands run.
+func New(opts Options) *Model {
+	if opts.Refresh <= 0 {
+		opts.Refresh = 2 * time.Second
+	}
+	m := &Model{
+		opts:       opts,
+		connecting: true,
+		atespace:   opts.Atespace,
+		data:       map[viewKey]*dataset{},
+		tables:     map[viewKey]*tableState{},
+		lastState:  map[string]string{},
+		batches:    map[int]*actionBatch{},
+		repoll:     300 * time.Millisecond,
+		started:    time.Now(),
+	}
+	k := lookupKind(opts.Kind)
+	if k == nil {
+		k = lookupKind(string(kActors))
+	}
+	m.cur = m.keyFor(k.kind)
+	m.history = []viewKey{m.cur}
+	m.table().filter = opts.Filter
+	m.setStatus("Connecting to "+opts.ConnLabel+"…", false)
+	return m
+}
+
+func (m *Model) Init() tea.Cmd {
+	return tea.Batch(m.connect(), m.tick())
+}
+
+func (m *Model) connect() tea.Cmd {
+	m.connecting = true
+	connect := m.opts.Connect
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		b, info, err := connect(ctx)
+		return connectedMsg{backend: b, info: info, err: err}
+	}
+}
+
+func (m *Model) tick() tea.Cmd {
+	return tea.Tick(m.opts.Refresh, func(t time.Time) tea.Msg { return tickMsg(t) })
+}
+
+func (m *Model) keyFor(k kind) viewKey {
+	switch {
+	case k == kAssignments:
+		return viewKey{k, m.worker}
+	case lookupKind(string(k)).scoped:
+		return viewKey{k, m.atespace}
+	}
+	return viewKey{k, ""}
+}
+
+func (m *Model) def() *kindDef { return lookupKind(string(m.cur.kind)) }
+
+func (m *Model) ds(k viewKey) *dataset {
+	d := m.data[k]
+	if d == nil {
+		d = &dataset{}
+		m.data[k] = d
+	}
+	return d
+}
+
+func (m *Model) table() *tableState { return m.tableFor(m.cur) }
+
+func (m *Model) tableFor(k viewKey) *tableState {
+	t := m.tables[k]
+	if t == nil {
+		t = &tableState{marked: map[string]bool{}}
+		m.tables[k] = t
+	}
+	return t
+}
+
+// fetch starts a background list unless one is already in flight.
+func (m *Model) fetch(k viewKey) tea.Cmd {
+	if m.backend == nil {
+		return nil
+	}
+	d := m.ds(k)
+	if d.loading {
+		return nil
+	}
+	d.loading = true
+	m.gen++
+	d.gen = m.gen
+	gen, b, def := m.gen, m.backend, lookupKind(string(k.kind))
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		now := time.Now()
+		rows, err := def.fetch(ctx, b, k.scope, now)
+		return fetchedMsg{key: k, gen: gen, rows: rows, err: err, at: now}
+	}
+}
+
+// setView switches the table to k, showing cached rows at once.
+func (m *Model) setView(k viewKey, pushHistory bool) tea.Cmd {
+	m.closePager()
+	m.mode, m.confirm = modeTable, nil
+	if k != m.cur {
+		clear(m.table().marked)
+	}
+	m.cur = k
+	if pushHistory {
+		m.history = append(m.history[:m.histIdx+1], k)
+		m.histIdx = len(m.history) - 1
+	}
+	t := m.table()
+	if d := m.data[k]; d != nil {
+		t.rebuild(d.rows, m.def().columns, m.selectedID())
+	}
+	m.setStatus("Viewing "+string(k.kind), false)
+	return m.fetch(k)
+}
+
+func (m *Model) gotoKind(k kind, filter string) tea.Cmd {
+	key := m.keyFor(k)
+	t := m.tableFor(key)
+	t.filter = filter
+	if d := m.data[key]; d != nil {
+		t.rebuild(d.rows, lookupKind(string(k)).columns, "")
+	}
+	return m.setView(key, true)
+}
+
+func (m *Model) setAtespace(a string) tea.Cmd {
+	m.atespace = a
+	k := m.cur.kind
+	if !lookupKind(string(k)).scoped {
+		k = kActors
+	}
+	return m.setView(m.keyFor(k), true)
+}
+
+func (m *Model) setStatus(s string, isErr bool) {
+	m.status, m.statusErr, m.fetchErr = s, isErr, false
+}
+
+func (m *Model) selected() *row {
+	d := m.data[m.cur]
+	t := m.table()
+	if d == nil || t.cursor >= len(t.visible) || len(t.visible) == 0 {
+		return nil
+	}
+	return &d.rows[t.visible[t.cursor]]
+}
+
+func (m *Model) selectedID() string {
+	if r := m.selected(); r != nil {
+		return r.id
+	}
+	return ""
+}
+
+func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width, m.height = msg.Width, msg.Height
+		m.table().clamp(m.tableHeight())
+		return m, nil
+
+	case connectedMsg:
+		m.connecting = false
+		if msg.err != nil {
+			m.connErr = msg.err
+			m.setStatus("connect: "+msg.err.Error()+"  (r to retry)", true)
+			return m, nil
+		}
+		m.connErr = nil
+		m.backend, m.info = msg.backend, msg.info
+		m.setStatus("Viewing "+string(m.cur.kind), false)
+		// Warm the views people jump to first, all in parallel.
+		return m, tea.Batch(m.fetch(m.cur), m.fetch(viewKey{kAtespaces, ""}),
+			m.fetch(viewKey{kWorkers, ""}), m.fetch(viewKey{kActors, m.atespace}))
+
+	case fetchedMsg:
+		d := m.ds(msg.key)
+		if msg.gen != d.gen {
+			return m, nil
+		}
+		// Remember the selection against the old rows so the cursor stays on
+		// the same object after the refresh.
+		keep := ""
+		if msg.key == m.cur {
+			keep = m.selectedID()
+		}
+		d.loading = false
+		d.fetchedAt = msg.at
+		d.err = msg.err
+		if msg.err == nil {
+			d.rows = msg.rows
+			if msg.key.kind == kActors {
+				m.recordTimeline(msg.rows, msg.at)
+			}
+		}
+		if msg.key == m.cur {
+			if msg.err != nil {
+				m.setStatus(string(msg.key.kind)+": "+errString(msg.err), true)
+				m.fetchErr = true
+			} else if m.fetchErr {
+				m.setStatus("Viewing "+string(m.cur.kind), false)
+			}
+			t := m.table()
+			t.rebuild(d.rows, m.def().columns, keep)
+			t.clamp(m.tableHeight())
+		}
+		return m, nil
+
+	case tickMsg:
+		cmds := []tea.Cmd{m.tick()}
+		if m.backend != nil {
+			cmds = append(cmds, m.fetch(m.cur))
+			if m.pager != nil && m.pager.reload != nil && !m.pager.loading {
+				cmds = append(cmds, m.pager.reload())
+			}
+		}
+		return m, tea.Batch(cmds...)
+
+	case pagerMsg:
+		if m.pager == nil || msg.gen != m.pager.gen {
+			return m, nil
+		}
+		m.pager.loading = false
+		if msg.err != nil {
+			m.pager.setLines([]string{stStatusErr.Render(errString(msg.err))}, m.pagerHeight())
+		} else {
+			m.pager.setLines(msg.lines, m.pagerHeight())
+		}
+		return m, nil
+
+	case logChunkMsg:
+		if m.pager == nil || m.logs == nil || msg.gen != m.logs.gen {
+			return m, nil
+		}
+		m.pager.appendLines(msg.lines, m.pagerHeight())
+		if msg.done {
+			m.pager.title += stDim.Render("  (stream ended)")
+			return m, nil
+		}
+		return m, m.logs.wait()
+
+	case actionResultMsg:
+		return m, m.actionResult(msg)
+
+	case repollMsg:
+		if m.backend == nil {
+			return m, nil
+		}
+		return m, m.fetch(msg.key)
+
+	case journalMsg:
+		if msg.err != nil {
+			m.setStatus(m.status+"  (journal: "+msg.err.Error()+")", true)
+		}
+		return m, nil
+
+	case journalLoadedMsg:
+		m.journalLoaded, m.prior, m.journalErr = true, msg.entries, msg.err
+		if m.pager != nil && msg.gen == m.pager.gen {
+			m.pager.loading = false
+			m.pager.setLines(m.journalLines(), m.pagerHeight())
+		}
+		return m, nil
+
+	case tea.KeyMsg:
+		return m, m.handleKey(msg)
+	}
+	return m, nil
+}
+
+func errString(err error) string {
+	s := err.Error()
+	// gRPC errors read "rpc error: code = X desc = Y"; Y is what matters.
+	if i := strings.Index(s, "desc = "); i >= 0 {
+		s = s[i+len("desc = "):]
+	}
+	return s
+}
+
+func (m *Model) tableHeight() int {
+	h := m.height - headerHeight - footerHeight - 3 // borders + column header
+	if m.mode == modeCommand {
+		h -= 3
+	}
+	return max(h, 1)
+}
+
+func (m *Model) pagerHeight() int {
+	return max(m.height-headerHeight-footerHeight-2, 1)
+}
+
+// tlEvent is one observed actor state change.
+type tlEvent struct {
+	at       time.Time
+	id       string
+	from, to string
+	worker   string
+}
+
+const maxTimeline = 5000
+
+// recordTimeline diffs actor states against the previous poll.
+func (m *Model) recordTimeline(rows []row, at time.Time) {
+	for i := range rows {
+		r := &rows[i]
+		state := r.cells[2] + "@" + r.cells[4]
+		prev, seen := m.lastState[r.id]
+		if seen && prev == state {
+			continue
+		}
+		m.lastState[r.id] = state
+		from := ""
+		if seen {
+			from = strings.SplitN(prev, "@", 2)[0]
+		}
+		m.timeline = append(m.timeline, tlEvent{at: at, id: r.id, from: from, to: r.cells[2], worker: r.cells[4]})
+	}
+	if over := len(m.timeline) - maxTimeline; over > 0 {
+		m.timeline = append(m.timeline[:0], m.timeline[over:]...)
+	}
+}
+
+func fmtCount(visible, total int) string {
+	if visible == total {
+		return fmt.Sprint(total)
+	}
+	return fmt.Sprintf("%d/%d", visible, total)
+}

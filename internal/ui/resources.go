@@ -1,0 +1,361 @@
+package ui
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"strings"
+	"time"
+
+	"github.com/ate-tooling/ate-tui/internal/explain"
+	ateapi "go.ate.dev/substrate/api/ateapi/v1"
+	infrav1 "go.ate.dev/substrate/api/infra/k8s/ate/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// Backend is the data the UI reads and the writes it can make. ateconn.Conn
+// implements it.
+type Backend interface {
+	ListAtespaces(ctx context.Context) ([]*ateapi.Atespace, error)
+	ListActors(ctx context.Context, atespace string) ([]*ateapi.Actor, error)
+	ListActorTemplates(ctx context.Context, atespace string) ([]*ateapi.ActorTemplate, error)
+	ListTags(ctx context.Context, atespace string) ([]*ateapi.Tag, error)
+	ListWorkers(ctx context.Context) ([]*ateapi.Worker, error)
+	ListWorkerAssignments(ctx context.Context, worker string) ([]*ateapi.ActorAssignment, error)
+	ListWorkerPools(ctx context.Context) ([]infrav1.WorkerPool, error)
+	GetActorTemplate(ctx context.Context, ref *ateapi.ObjectRef) (*ateapi.ActorTemplate, error)
+	PodLogs(ctx context.Context, namespace, pod string, follow bool, tail int64) (io.ReadCloser, error)
+
+	SuspendActor(ctx context.Context, ref *ateapi.ObjectRef, mode ateapi.DurabilityMode) (*ateapi.Actor, error)
+	ResumeActor(ctx context.Context, ref *ateapi.ObjectRef) (*ateapi.Actor, error)
+	RevertActor(ctx context.Context, ref *ateapi.ObjectRef) (*ateapi.Actor, error)
+	DeleteActor(ctx context.Context, ref *ateapi.ObjectRef) (*ateapi.Actor, error)
+	DrainWorker(ctx context.Context, name string) (*ateapi.Worker, error)
+	MarkWorkerAvailable(ctx context.Context, name string) (*ateapi.Worker, error)
+	MarkWorkerUnavailable(ctx context.Context, name string) (*ateapi.Worker, error)
+}
+
+type kind string
+
+const (
+	kAtespaces   kind = "atespaces"
+	kActors      kind = "actors"
+	kTemplates   kind = "templates"
+	kTags        kind = "tags"
+	kWorkers     kind = "workers"
+	kWorkerPools kind = "workerpools"
+	kAssignments kind = "assignments"
+)
+
+// hint is one key shown in the header.
+type hint struct{ key, desc string }
+
+type kindDef struct {
+	kind    kind
+	aliases []string
+	// scoped kinds are filtered by the current atespace.
+	scoped  bool
+	columns []string
+	// drop lists the columns to hide, in order, when the terminal is narrow.
+	drop  []int
+	hints []hint
+	// fetch runs off the UI goroutine and returns ready-to-render rows.
+	fetch func(ctx context.Context, b Backend, scope string, now time.Time) ([]row, error)
+}
+
+var kinds = []*kindDef{
+	{
+		kind: kActors, aliases: []string{"actor", "act", "a"}, scoped: true,
+		columns: []string{"ATESPACE", "NAME", "STATE", "TEMPLATE", "WORKER", "NODE", "GEN", "UPDATED", "AGE"},
+		drop:    []int{6, 5, 7, 3},
+		hints: []hint{{"⏎", "explain"}, {"y", "yaml"}, {"l", "logs"}, {"T", "timeline"},
+			{"o", "worker"}, {"t", "template"}, {"␣", "mark"}, {"s", "suspend"}, {"R", "resume"},
+			{"v", "revert"}, {"^d", "delete"}},
+		fetch: func(ctx context.Context, b Backend, scope string, now time.Time) ([]row, error) {
+			as, err := b.ListActors(ctx, scope)
+			if err != nil {
+				return nil, err
+			}
+			rows := make([]row, 0, len(as))
+			for _, a := range as {
+				rows = append(rows, actorRow(a, now))
+			}
+			return rows, nil
+		},
+	},
+	{
+		kind: kWorkers, aliases: []string{"worker", "wk", "w"},
+		columns: []string{"NAME", "STATE", "POOL", "NODE", "ACTORS", "CPU", "MEM", "POD", "AGE"},
+		drop:    []int{7, 6, 5, 3},
+		hints: []hint{{"⏎", "assignments"}, {"y", "yaml"}, {"X", "explain"}, {"p", "pool"},
+			{"␣", "mark"}, {"D", "drain"}, {"A", "available"}, {"U", "unavailable"}},
+		fetch: func(ctx context.Context, b Backend, _ string, now time.Time) ([]row, error) {
+			ws, err := b.ListWorkers(ctx)
+			if err != nil {
+				return nil, err
+			}
+			rows := make([]row, 0, len(ws))
+			for _, w := range ws {
+				rows = append(rows, workerRow(w, now))
+			}
+			return rows, nil
+		},
+	},
+	{
+		kind: kTemplates, aliases: []string{"template", "actortemplates", "actortemplate", "tpl"}, scoped: true,
+		columns: []string{"ATESPACE", "NAME", "IMAGES", "CPU", "MEM", "GOLDEN", "AGE"},
+		drop:    []int{4, 3, 2},
+		hints:   []hint{{"⏎", "actors"}, {"y", "yaml"}, {"X", "explain"}},
+		fetch: func(ctx context.Context, b Backend, scope string, now time.Time) ([]row, error) {
+			ts, err := b.ListActorTemplates(ctx, scope)
+			if err != nil {
+				return nil, err
+			}
+			rows := make([]row, 0, len(ts))
+			for _, t := range ts {
+				rows = append(rows, templateRow(t, now))
+			}
+			return rows, nil
+		},
+	},
+	{
+		kind: kAtespaces, aliases: []string{"atespace", "as", "ns"},
+		columns: []string{"NAME", "UID", "AGE"},
+		drop:    []int{1},
+		hints:   []hint{{"⏎", "actors"}, {"y", "yaml"}},
+		fetch: func(ctx context.Context, b Backend, _ string, now time.Time) ([]row, error) {
+			as, err := b.ListAtespaces(ctx)
+			if err != nil {
+				return nil, err
+			}
+			rows := make([]row, 0, len(as))
+			for _, a := range as {
+				md := a.GetMetadata()
+				rows = append(rows, newRow(md.GetName(), a, lvNormal,
+					[]string{md.GetName(), md.GetUid(), age(md.GetCreateTime().AsTime(), now)},
+					map[int]string{2: sortTime(md.GetCreateTime().AsTime())}))
+			}
+			return rows, nil
+		},
+	},
+	{
+		kind: kTags, aliases: []string{"tag"}, scoped: true,
+		columns: []string{"ATESPACE", "NAME", "SCOPE", "SOURCE", "GEN", "FIDELITY", "AGE"},
+		drop:    []int{5, 3},
+		hints:   []hint{{"y", "yaml"}},
+		fetch: func(ctx context.Context, b Backend, scope string, now time.Time) ([]row, error) {
+			ts, err := b.ListTags(ctx, scope)
+			if err != nil {
+				return nil, err
+			}
+			rows := make([]row, 0, len(ts))
+			for _, t := range ts {
+				md := t.GetMetadata()
+				snap := t.GetStatus().GetSnapshot()
+				rows = append(rows, newRow(md.GetAtespace()+"/"+md.GetName(), t, lvNormal, []string{
+					md.GetAtespace(), md.GetName(),
+					enumTitle(t.GetScope().String(), "TAG_SCOPE_"),
+					dash(t.GetSourceActor().GetName()),
+					fmt.Sprint(snap.GetGeneration()),
+					enumTitle(snap.GetFidelity().String(), "SNAPSHOT_FIDELITY_"),
+					age(md.GetCreateTime().AsTime(), now),
+				}, map[int]string{6: sortTime(md.GetCreateTime().AsTime())}))
+			}
+			return rows, nil
+		},
+	},
+	{
+		kind: kWorkerPools, aliases: []string{"workerpool", "wp", "pools", "pool"},
+		columns: []string{"NAMESPACE", "NAME", "DESIRED", "CURRENT", "READY", "SANDBOX", "AGE"},
+		drop:    []int{3, 2, 5},
+		hints:   []hint{{"⏎", "workers"}, {"y", "yaml"}, {"X", "explain"}},
+		fetch: func(ctx context.Context, b Backend, _ string, now time.Time) ([]row, error) {
+			ps, err := b.ListWorkerPools(ctx)
+			if err != nil {
+				return nil, err
+			}
+			rows := make([]row, 0, len(ps))
+			for i := range ps {
+				rows = append(rows, poolRow(&ps[i], now))
+			}
+			return rows, nil
+		},
+	},
+	{
+		kind: kAssignments, aliases: []string{"assignment"},
+		columns: []string{"ATESPACE", "ACTOR", "CPU", "MEM", "AGE"},
+		hints:   []hint{{"⏎", "actor"}, {"y", "yaml"}},
+		fetch: func(ctx context.Context, b Backend, worker string, now time.Time) ([]row, error) {
+			if worker == "" {
+				return nil, fmt.Errorf("pick a worker and press ⏎ to list its assignments")
+			}
+			as, err := b.ListWorkerAssignments(ctx, worker)
+			if err != nil {
+				return nil, err
+			}
+			rows := make([]row, 0, len(as))
+			for _, a := range as {
+				md := a.GetMetadata()
+				rows = append(rows, newRow(a.GetActor().GetAtespace()+"/"+a.GetActor().GetName(), a, lvNormal, []string{
+					a.GetActor().GetAtespace(), a.GetActor().GetName(),
+					explain.Millicores(a.GetResources().GetCpuMillicores()),
+					explain.Bytes(a.GetResources().GetMemoryBytes()),
+					age(md.GetCreateTime().AsTime(), now),
+				}, map[int]string{4: sortTime(md.GetCreateTime().AsTime())}))
+			}
+			return rows, nil
+		},
+	},
+}
+
+func lookupKind(name string) *kindDef {
+	name = strings.ToLower(name)
+	for _, k := range kinds {
+		if string(k.kind) == name {
+			return k
+		}
+		for _, a := range k.aliases {
+			if a == name {
+				return k
+			}
+		}
+	}
+	return nil
+}
+
+func actorRow(a *ateapi.Actor, now time.Time) row {
+	md := a.GetMetadata()
+	st := a.GetStatus()
+	lv := lvNormal
+	switch st.GetState() {
+	case ateapi.ActorState_ACTOR_STATE_SUSPENDED:
+		lv = lvIdle
+	case ateapi.ActorState_ACTOR_STATE_CRASHED:
+		lv = lvError
+	case ateapi.ActorState_ACTOR_STATE_RESUMING, ateapi.ActorState_ACTOR_STATE_SUSPENDING, ateapi.ActorState_ACTOR_STATE_REVERTING:
+		lv = lvProgress
+		if now.Sub(md.GetUpdateTime().AsTime()) > explain.StuckAfter {
+			lv = lvWarn
+		}
+	case ateapi.ActorState_ACTOR_STATE_DELETING:
+		lv = lvGone
+	}
+	gen := "-"
+	if g := st.GetLastAssignedGeneration(); g > 0 {
+		gen = fmt.Sprint(g)
+	}
+	return newRow(md.GetAtespace()+"/"+md.GetName(), a, lv, []string{
+		md.GetAtespace(), md.GetName(),
+		explain.ActorState(st.GetState()),
+		dash(a.GetActorTemplate().GetName()),
+		dash(st.GetWorkerAssignment().GetWorker().GetName()),
+		dash(st.GetAssignedNode()),
+		gen,
+		age(md.GetUpdateTime().AsTime(), now),
+		age(md.GetCreateTime().AsTime(), now),
+	}, map[int]string{
+		7: sortTime(md.GetUpdateTime().AsTime()),
+		8: sortTime(md.GetCreateTime().AsTime()),
+	})
+}
+
+func workerRow(w *ateapi.Worker, now time.Time) row {
+	md := w.GetMetadata()
+	st := w.GetStatus()
+	lv := lvNormal
+	switch st.GetState() {
+	case ateapi.WorkerState_WORKER_STATE_DRAINING:
+		lv = lvWarn
+	case ateapi.WorkerState_WORKER_STATE_UNAVAILABLE:
+		lv = lvError
+	}
+	capA, used := st.GetCapacity().GetActors(), st.GetAllocated().GetActors()
+	if lv == lvNormal && capA > 0 && used >= capA {
+		lv = lvWarn
+	}
+	return newRow(md.GetName(), w, lv, []string{
+		md.GetName(),
+		explain.WorkerState(st.GetState()),
+		dash(w.GetWorkerPool()),
+		dash(w.GetNodeName()),
+		fmt.Sprintf("%d/%d", used, capA),
+		explain.Millicores(st.GetAllocated().GetCpuMillicores()) + "/" + explain.Millicores(st.GetCapacity().GetCpuMillicores()),
+		explain.Bytes(st.GetAllocated().GetMemoryBytes()) + "/" + explain.Bytes(st.GetCapacity().GetMemoryBytes()),
+		dash(w.GetWorkerPod()),
+		age(md.GetCreateTime().AsTime(), now),
+	}, map[int]string{
+		4: fmt.Sprintf("%010d", used),
+		8: sortTime(md.GetCreateTime().AsTime()),
+	})
+}
+
+func templateRow(t *ateapi.ActorTemplate, now time.Time) row {
+	md := t.GetMetadata()
+	var imgs []string
+	for _, c := range t.GetContainers() {
+		imgs = append(imgs, c.GetImage())
+	}
+	gs := t.GetStatus().GetGoldenSnapshotStatus()
+	golden, lv := "-", lvNormal
+	switch {
+	case gs.GetErrorMessage() != "":
+		golden, lv = "Error", lvError
+	case gs.GetGoldenTag().GetName() != "":
+		golden = gs.GetGoldenTag().GetName()
+	}
+	lim := t.GetResources().GetLimits()
+	return newRow(md.GetAtespace()+"/"+md.GetName(), t, lv, []string{
+		md.GetAtespace(), md.GetName(), dash(strings.Join(imgs, ",")),
+		explain.Millicores(lim.GetCpuMillicores()), explain.Bytes(lim.GetMemoryBytes()),
+		golden, age(md.GetCreateTime().AsTime(), now),
+	}, map[int]string{6: sortTime(md.GetCreateTime().AsTime())})
+}
+
+func poolRow(p *infrav1.WorkerPool, now time.Time) row {
+	lv := lvNormal
+	if p.Status.ReadyReplicas < p.Spec.Replicas {
+		lv = lvWarn
+	}
+	var classes []string
+	for _, sc := range p.Status.SandboxClasses {
+		name := string(sc.Name)
+		for _, c := range sc.Conditions {
+			if c.Type == infrav1.WorkerPoolSandboxClassConditionResolved && c.Status != metav1.ConditionTrue {
+				lv = lvError
+				name += "!"
+			}
+		}
+		classes = append(classes, name)
+	}
+	return newRow(p.Namespace+"/"+p.Name, p, lv, []string{
+		p.Namespace, p.Name,
+		fmt.Sprint(p.Spec.Replicas), fmt.Sprint(p.Status.Replicas), fmt.Sprint(p.Status.ReadyReplicas),
+		dash(strings.Join(classes, ",")),
+		age(p.CreationTimestamp.Time, now),
+	}, map[int]string{
+		2: fmt.Sprintf("%010d", p.Spec.Replicas),
+		3: fmt.Sprintf("%010d", p.Status.Replicas),
+		4: fmt.Sprintf("%010d", p.Status.ReadyReplicas),
+		6: sortTime(p.CreationTimestamp.Time),
+	})
+}
+
+func age(t, now time.Time) string { return explain.Age(t, now) }
+
+// sortTime sorts newest first under an ascending sort, like kubectl AGE.
+func sortTime(t time.Time) string { return fmt.Sprintf("%020d", 1<<62-t.UnixNano()) }
+
+func dash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+func enumTitle(s, prefix string) string {
+	s = strings.TrimPrefix(s, prefix)
+	if s == "" || s == "UNSPECIFIED" {
+		return "-"
+	}
+	return s[:1] + strings.ToLower(s[1:])
+}
