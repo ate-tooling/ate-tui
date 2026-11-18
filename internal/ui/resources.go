@@ -63,7 +63,11 @@ const (
 	kWorkers     kind = "workers"
 	kWorkerPools kind = "workerpools"
 	kAssignments kind = "assignments"
+	kHistory     kind = "history"
 )
+
+// workerScoped kinds list what one worker holds, scoped by its name.
+func workerScoped(k kind) bool { return k == kAssignments || k == kHistory }
 
 // hint is one key shown in the header. Kind and table hints name the
 // default key, which the keymap shows as rebound.
@@ -81,6 +85,11 @@ type kindDef struct {
 	// drop lists the columns to hide, in order, when the terminal is narrow.
 	drop  []int
 	hints []hint
+	// sortCol is the column a new table sorts by.
+	sortCol int
+	// manual kinds refresh on r only: their fetch is too heavy to repeat
+	// every tick.
+	manual bool
 	// fetch runs off the UI goroutine and returns ready-to-render rows.
 	fetch func(ctx context.Context, b Backend, scope string, now time.Time) ([]row, error)
 }
@@ -112,7 +121,7 @@ var kinds = []*kindDef{
 		wide:    []string{"NAMESPACE", "EPOCHS", "LABELS", "UID"},
 		drop:    []int{7, 6, 5, 3},
 		hints: []hint{{"enter", "assignments"}, {"y", "yaml"}, {"X", "explain"}, {"u", "relations"},
-			{"E", "events"}, {"p", "pool"}, {" ", "mark"}, {"D", "drain"}, {"A", "available"},
+			{"l", "logs"}, {"E", "events"}, {"p", "pool"}, {" ", "mark"}, {"D", "drain"}, {"A", "available"},
 			{"U", "unavailable"}},
 		fetch: func(ctx context.Context, b Backend, _ string, now time.Time) ([]row, error) {
 			ws, err := b.ListWorkers(ctx)
@@ -236,6 +245,12 @@ var kinds = []*kindDef{
 			}
 			return rows, nil
 		},
+	},
+	{
+		kind: kHistory, aliases: []string{"hist"}, manual: true, sortCol: 5,
+		columns: []string{"ATESPACE", "ACTOR", "STATUS", "LINES", "FIRST", "LAST"},
+		hints:   []hint{{"enter", "logs"}, {"r", "reread"}},
+		fetch:   fetchHistory,
 	},
 }
 

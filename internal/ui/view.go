@@ -105,7 +105,7 @@ func (m *Model) viewHeader() []string {
 	if scope == "" {
 		scope = "<all>"
 	}
-	if m.cur.kind == kAssignments {
+	if workerScoped(m.cur.kind) {
 		scope = "worker " + m.worker
 	}
 	ctx := m.info.Context
@@ -211,7 +211,7 @@ func (m *Model) viewTable() []string {
 	inner := m.width - 4
 
 	title := stTitleKind.Render(string(m.cur.kind))
-	if def.scoped || m.cur.kind == kAssignments {
+	if def.scoped || workerScoped(m.cur.kind) {
 		scope := m.cur.scope
 		if scope == "" {
 			scope = "all"

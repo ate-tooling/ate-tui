@@ -194,7 +194,7 @@ func (m *Model) switchContext(name string) tea.Cmd {
 	m.timeline, m.lastState = nil, map[string]string{}
 	m.want, m.worker, m.atespace = wantRow{}, "", ""
 	k := m.cur.kind
-	if k == kAssignments {
+	if workerScoped(k) {
 		k = kActors
 	}
 	m.cur = m.keyFor(k)

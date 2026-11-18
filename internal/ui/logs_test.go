@@ -13,6 +13,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	ateapi "go.ate.dev/substrate/api/ateapi/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 )
 
@@ -173,6 +175,42 @@ func TestLogsFollowMigration(t *testing.T) {
 		t.Fatalf("wait lines %q, want %q", got, want)
 	}
 	m.closePager()
+}
+
+func TestLogsKeptAfterDelete(t *testing.T) {
+	b := &logBackend{Backend: demo.New(), lines: map[string][]string{
+		"pod-a": {kubeLine(0, "agent", "working"), kubeLine(time.Second, "", "torn down")},
+	}, open: map[string]bool{"pod-a": true}}
+	m := logModel(t, b)
+	cmd := m.openLogs(logActor(ateapi.ActorState_ACTOR_STATE_RUNNING, "pod-a"))
+	pump(t, m, cmd, func() bool { return len(m.logs.entries) == 2 })
+	// Deleting stops the stream; then the actor is gone.
+	m.Update(logActorMsg{gen: m.logs.gen, actor: logActor(ateapi.ActorState_ACTOR_STATE_DELETING, "")})
+	b.mu.Lock()
+	b.lines["pod-a"] = append(b.lines["pod-a"], kubeLine(2*time.Second, "", "last words"))
+	b.open["pod-a"] = false
+	b.mu.Unlock()
+	_, cmd = m.Update(logActorMsg{gen: m.logs.gen, err: status.Error(codes.NotFound, "actor not found")})
+	if !m.logs.kept || m.pager == nil {
+		t.Fatal("pager not kept after the delete")
+	}
+	for cmd != nil {
+		_, cmd = m.Update(run(t, cmd))
+	}
+	want := []string{"working", "torn down", "waiting: actor is Deleting",
+		"── actor deleted; showing what ate-workers/pod-a kept ──", "last words"}
+	if got := msgs(m); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("entries %q, want %q", got, want)
+	}
+	if c := b.call(len(b.calls) - 1); c.opts.Follow || c.opts.SinceTime == nil {
+		t.Fatalf("final read options %+v", c.opts)
+	}
+	if m.pollLogActor() != nil {
+		t.Error("still polling a deleted actor")
+	}
+	if !strings.Contains(m.View(), "kept by ate-workers/pod-a") {
+		t.Error("title does not say where the lines are kept")
+	}
 }
 
 func TestLogsSamePodReconnectHasNoDuplicates(t *testing.T) {

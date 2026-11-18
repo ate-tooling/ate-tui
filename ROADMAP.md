@@ -27,6 +27,7 @@ in config, and every write asks for confirmation.
   access policy bindings. ateapi has no can-i RPC, so ate-tui shows bindings
   and does not predict permissions.
 - `E`: Kubernetes events for the hosting worker pod.
+- `l` on a worker: the actors its pod kept logs for, deleted ones included.
 
 ## Milestone 4 (done): Proxy
 

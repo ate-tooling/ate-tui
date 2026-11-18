@@ -345,6 +345,7 @@ func (m *Model) openHelp() {
 		}},
 		{"Workers & pools", []hint{
 			{"⏎", "worker: actor assignments · pool: its workers"},
+			{"l", "worker: actors its pod kept logs for, deleted ones too; ⏎ reads them"},
 			{"X", "explain capacity, epochs, sandbox config, pod Warning events"},
 			{"p", "worker: jump to its pool"},
 		}},

@@ -122,6 +122,7 @@ func New() *Backend {
 		b.actors = append(b.actors, a)
 	}
 	b.actors[0].Metadata.Name = b.actors[0].ActorTemplate.Name + "-nomad"
+	b.ghosts(now)
 	for i := 0; i < 9; i++ {
 		b.place(b.actors[i*2], b.workers[i%3])
 	}
@@ -146,6 +147,23 @@ func New() *Backend {
 	}
 	b.recount()
 	return b
+}
+
+// ghosts leaves lines from actors deleted before the demo started on the
+// first workers' pods, as a real worker pod keeps them.
+func (b *Backend) ghosts(now time.Time) {
+	for i, w := range b.workers[:3] {
+		for j, n := range []string{"browser-agent", "repo-agent"} {
+			as := map[bool]string{true: "research", false: "codegen"}[j == 0]
+			a := &ateapi.Actor{Metadata: &ateapi.ResourceMetadata{Atespace: as, Name: n + "-" + randSuffix(b.rng)}}
+			at := now.Add(-time.Duration(3-j) * time.Hour).Add(time.Duration(i) * 7 * time.Minute)
+			b.emitAt(at, w.WorkerPod, a, "", "restored from snapshot generation 1 in 298ms")
+			for k, msg := range []string{"listening on :8080", "tool call: web.search", "model response 1204 tokens", "tool call: fs.write report.md"} {
+				b.emitAt(at.Add(time.Duration(k+1)*90*time.Second), w.WorkerPod, a, "agent", msg)
+			}
+			b.emitAt(at.Add(8*time.Minute), w.WorkerPod, a, "", "actor deleted; sandbox torn down")
+		}
+	}
 }
 
 func randSuffix(r *rand.Rand) string {
