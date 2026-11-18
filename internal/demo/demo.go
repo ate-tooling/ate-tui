@@ -5,7 +5,6 @@ package demo
 import (
 	"context"
 	"fmt"
-	"io"
 	"math/rand"
 	"strings"
 	"sync"
@@ -32,6 +31,12 @@ type Backend struct {
 	// pending counts the polls left before a transition started by a write
 	// completes, so the UI sees SUSPENDING before SUSPENDED.
 	pending map[*ateapi.Actor]int
+
+	// migrant moves between two workers on a cycle, so logs can be seen
+	// following it; nil once a write touches it.
+	migrant  *ateapi.Actor
+	noEgress *ateapi.Actor
+	podLogs  map[string]*podLog
 }
 
 func ts(t time.Time) *timestamppb.Timestamp { return timestamppb.New(t) }
@@ -39,7 +44,7 @@ func ts(t time.Time) *timestamppb.Timestamp { return timestamppb.New(t) }
 func New() *Backend {
 	now := time.Now()
 	b := &Backend{start: now, rng: rand.New(rand.NewSource(7)),
-		pinned: map[*ateapi.Actor]bool{}, pending: map[*ateapi.Actor]int{}}
+		pinned: map[*ateapi.Actor]bool{}, pending: map[*ateapi.Actor]int{}, podLogs: map[string]*podLog{}}
 	md := func(as, name string, age time.Duration) *ateapi.ResourceMetadata {
 		return &ateapi.ResourceMetadata{Atespace: as, Name: name, Uid: fmt.Sprintf("%08x-%04x", b.rng.Uint32(), b.rng.Intn(65535)),
 			CreateTime: ts(now.Add(-age)), UpdateTime: ts(now.Add(-age / 3))}
@@ -113,6 +118,7 @@ func New() *Backend {
 		}
 		b.actors = append(b.actors, a)
 	}
+	b.actors[0].Metadata.Name = b.actors[0].ActorTemplate.Name + "-nomad"
 	for i := 0; i < 9; i++ {
 		b.place(b.actors[i*2], b.workers[i%3])
 	}
@@ -124,6 +130,9 @@ func New() *Backend {
 	stuck.Metadata.UpdateTime = ts(now.Add(-6 * time.Minute))
 	b.actors[11].WorkerSelector = &ateapi.Selector{MatchLabels: map[string]string{"gpu": "a100"}}
 	b.pinned[crash], b.pinned[stuck], b.pinned[b.actors[11]] = true, true, true
+	b.migrant = b.actors[0]
+	b.pinned[b.migrant] = true
+	b.noEgress = b.actors[1]
 	for _, a := range b.actors {
 		if a.Status.State == ateapi.ActorState_ACTOR_STATE_SUSPENDED && b.rng.Intn(2) == 0 {
 			a.Status.LastAssignedGeneration = int32(1 + b.rng.Intn(5))
@@ -154,6 +163,8 @@ func (b *Backend) place(a *ateapi.Actor, w *ateapi.Worker) {
 		SandboxRuntime: &ateapi.ActorSandboxRuntime{SandboxClass: w.Labels["sandbox"]},
 	}
 	a.Metadata.UpdateTime = ts(time.Now())
+	b.emit(w.WorkerPod, a, "", fmt.Sprintf("restored from snapshot generation %d in 312ms", max(a.Status.LastAssignedGeneration, 1)))
+	b.emit(w.WorkerPod, a, "agent", "listening on :8080")
 }
 
 func (b *Backend) recount() {
@@ -172,6 +183,7 @@ func (b *Backend) recount() {
 // to show live, and finishes transitions started by writes.
 func (b *Backend) step() {
 	now := time.Now()
+	b.migrate(now)
 	kept := b.actors[:0]
 	for _, a := range b.actors {
 		if n, ok := b.pending[a]; ok {
@@ -224,6 +236,9 @@ func (b *Backend) finish(a *ateapi.Actor, now time.Time) {
 }
 
 func (b *Backend) suspended(a *ateapi.Actor) {
+	if pod := a.Status.GetWorkerAssignment().GetWorkerPod(); pod != "" {
+		b.emit(pod, a, "", fmt.Sprintf("checkpoint generation %d committed; releasing worker", a.Status.LastAssignedGeneration+1))
+	}
 	a.Status.State = ateapi.ActorState_ACTOR_STATE_SUSPENDED
 	a.Status.WorkerAssignment = nil
 	a.Status.LastAssignedGeneration++
@@ -356,44 +371,4 @@ func (b *Backend) ListWorkerPools(context.Context) ([]infrav1.WorkerPool, error)
 		out[i] = *b.pools[i].DeepCopy()
 	}
 	return out, nil
-}
-
-// PodLogs emits JSON lines in the worker's log format for every actor on
-// the pod, as a multiplexed worker would.
-func (b *Backend) PodLogs(ctx context.Context, _, pod string, follow bool, _ int64) (io.ReadCloser, error) {
-	type ref struct{ as, name string }
-	b.mu.Lock()
-	var on []ref
-	for _, a := range b.actors {
-		if a.Status.GetWorkerAssignment().GetWorkerPod() == pod {
-			on = append(on, ref{a.Metadata.Atespace, a.Metadata.Name})
-		}
-	}
-	b.mu.Unlock()
-	pr, pw := io.Pipe()
-	go func() {
-		defer pw.Close()
-		line := func(r ref, container, msg string) {
-			c := ""
-			if container != "" {
-				c = fmt.Sprintf(`,"ate.actor.container.name":%q`, container)
-			}
-			fmt.Fprintf(pw, `{"time":%q,"message":%q,"labels":{"ate.atespace":%q,"ate.actor.name":%q%s}}`+"\n",
-				time.Now().Format(time.RFC3339Nano), msg, r.as, r.name, c)
-		}
-		for _, r := range on {
-			line(r, "", "restored from snapshot generation 2 in 312ms")
-			line(r, "agent", "listening on :8080")
-		}
-		msgs := []string{"tool call: web.search", "tool call: fs.read README.md", "model response 812 tokens", "checkpoint idle timer reset", "GET / 200 4ms"}
-		for i := 0; follow && len(on) > 0; i++ {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(time.Duration(100+rand.Intn(400)) * time.Millisecond):
-			}
-			line(on[rand.Intn(len(on))], "agent", msgs[i%len(msgs)])
-		}
-	}()
-	return pr, nil
 }

@@ -11,6 +11,7 @@ import (
 
 	ateapi "go.ate.dev/substrate/api/ateapi/v1"
 	infrav1 "go.ate.dev/substrate/api/infra/k8s/ate/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -71,7 +72,10 @@ type ActorInput struct {
 	Template    *ateapi.ActorTemplate
 	TemplateErr error
 	Workers     []*ateapi.Worker
-	Now         time.Time
+	// PodEvents are the Kubernetes events of the worker pod hosting the
+	// actor; nil when not fetched.
+	PodEvents []corev1.Event
+	Now       time.Time
 }
 
 // Actor explains an actor's state.
@@ -105,6 +109,7 @@ func Actor(in ActorInput) Report {
 		r.Summary = "Actor is running."
 		r.add(OK, "Running on worker "+st.GetWorkerAssignment().GetWorker().GetName())
 		checkAssignedWorker(&r, st.GetWorkerAssignment(), in.Workers)
+		checkPodEvents(&r, st.GetWorkerAssignment().GetWorkerNamespace(), st.GetWorkerAssignment().GetWorkerPod(), in.PodEvents, in.Now)
 		r.Next = append(r.Next, "kubectl ate logs actor "+ref, "kubectl ate proxy actor "+ref)
 	case ateapi.ActorState_ACTOR_STATE_SUSPENDED:
 		r.Summary = "Actor is suspended and resumes on the next request."
@@ -265,6 +270,7 @@ func checkTemplate(r *Report, a *ateapi.Actor, t *ateapi.ActorTemplate, err erro
 type WorkerInput struct {
 	Worker      *ateapi.Worker
 	Assignments []*ateapi.ActorAssignment
+	PodEvents   []corev1.Event
 	Now         time.Time
 }
 
@@ -322,6 +328,7 @@ func Worker(in WorkerInput) Report {
 		}
 		r.add(Info, fmt.Sprintf("%d actor assignment(s)", len(in.Assignments)), lines...)
 	}
+	checkPodEvents(&r, w.GetWorkerNamespace(), w.GetWorkerPod(), in.PodEvents, in.Now)
 	r.Next = append(r.Next, "kubectl -n "+w.GetWorkerNamespace()+" describe pod "+w.GetWorkerPod())
 	return r
 }
@@ -445,6 +452,52 @@ func WorkerPool(p *infrav1.WorkerPool, workers []*ateapi.Worker, now time.Time) 
 		r.add(l, fmt.Sprintf("%d registered worker(s)", n), strings.Join(parts, "  "))
 	}
 	return r
+}
+
+// RecentEvents is how far back Warning events on a worker pod count.
+const RecentEvents = time.Hour
+
+// checkPodEvents reports recent Warning events on a worker pod, newest
+// first.
+func checkPodEvents(r *Report, namespace, pod string, events []corev1.Event, now time.Time) {
+	var warn []corev1.Event
+	for _, e := range events {
+		if e.Type == corev1.EventTypeWarning && now.Sub(EventTime(&e)) <= RecentEvents {
+			warn = append(warn, e)
+		}
+	}
+	if len(warn) == 0 {
+		return
+	}
+	sort.SliceStable(warn, func(i, j int) bool { return EventTime(&warn[i]).After(EventTime(&warn[j])) })
+	var lines []string
+	for i, e := range warn {
+		if i == 5 {
+			lines = append(lines, fmt.Sprintf("… and %d more", len(warn)-i))
+			break
+		}
+		count := ""
+		if e.Count > 1 {
+			count = fmt.Sprintf(" x%d", e.Count)
+		}
+		lines = append(lines, fmt.Sprintf("%s%s, %s ago: %s", e.Reason, count, Age(EventTime(&e), now), e.Message))
+	}
+	r.add(Warn, fmt.Sprintf("%d Warning event(s) on worker pod %s/%s in the last hour", len(warn), namespace, pod), lines...)
+	r.Next = append(r.Next, "kubectl -n "+namespace+" get events --field-selector involvedObject.name="+pod)
+}
+
+// EventTime is when an event last happened, from whichever field the
+// reporter set.
+func EventTime(e *corev1.Event) time.Time {
+	switch {
+	case !e.LastTimestamp.IsZero():
+		return e.LastTimestamp.Time
+	case !e.EventTime.IsZero():
+		return e.EventTime.Time
+	case !e.FirstTimestamp.IsZero():
+		return e.FirstTimestamp.Time
+	}
+	return e.CreationTimestamp.Time
 }
 
 func findWorker(ws []*ateapi.Worker, name string) *ateapi.Worker {

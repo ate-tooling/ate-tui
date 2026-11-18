@@ -111,6 +111,23 @@ func TestFrameFitsTerminal(t *testing.T) {
 			{"wrong", "enter"},
 			{"esc", "esc", ":", "workers", "enter", "D"},
 			{"esc", ":", "journal", "enter"},
+			{"esc", ":", "pulse", "enter"},
+			{"j", "G"},
+			{"esc", ":", "access", "enter"},
+			{"esc", ":", "actors", "enter", "u"},
+			{"j", "j"},
+			{"enter"},
+			{"u"},
+			{"esc", ":", "templates", "enter", "u"},
+			{"esc", ":", "workerpools", "enter", "u"},
+			{"esc", ":", "actors", "enter", "e"},
+			{"esc", "j", "E"},
+			{"esc", ":", "workers", "enter", "E"},
+			{"esc", ":", "actors", "enter", "l"},
+			{"c", "w"},
+			{"/", "listening", "enter", "n"},
+			{"/", "typing"},
+			{"esc", "esc", "esc"},
 		} {
 			press(m, step...)
 			checkFrame(t, m, w, h)

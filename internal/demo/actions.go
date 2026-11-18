@@ -39,6 +39,9 @@ func stateName(s ateapi.ActorState) string { return s.String()[len("ACTOR_STATE_
 
 // begin moves a to an in-progress state that completes after settle polls.
 func (b *Backend) begin(a *ateapi.Actor, s ateapi.ActorState) {
+	if a == b.migrant {
+		b.migrant = nil
+	}
 	a.Status.State = s
 	a.Metadata.UpdateTime = ts(time.Now())
 	b.pending[a] = settle
@@ -49,6 +52,9 @@ func (b *Backend) begin(a *ateapi.Actor, s ateapi.ActorState) {
 // alone from now on, so only the user's writes move it.
 func (b *Backend) result(a *ateapi.Actor) (*ateapi.Actor, error) {
 	b.pinned[a] = true
+	if a == b.migrant {
+		b.migrant = nil
+	}
 	return proto.Clone(a).(*ateapi.Actor), nil
 }
 

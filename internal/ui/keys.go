@@ -5,6 +5,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/ate-tooling/ate-tui/internal/explain"
 	tea "github.com/charmbracelet/bubbletea"
 	ateapi "go.ate.dev/substrate/api/ateapi/v1"
 	infrav1 "go.ate.dev/substrate/api/infra/k8s/ate/v1"
@@ -159,6 +160,8 @@ func (m *Model) keyRow(key string, r *row) tea.Cmd {
 		return m.openYAML(m.cur, r.id)
 	case "X":
 		return m.openExplain(m.cur, r.id)
+	case "u":
+		return m.openRelations(r)
 	}
 	switch o := r.obj.(type) {
 	case *ateapi.Actor:
@@ -167,6 +170,15 @@ func (m *Model) keyRow(key string, r *row) tea.Cmd {
 			return m.openExplain(m.cur, r.id)
 		case "l":
 			return m.openLogs(o)
+		case "e":
+			return m.openEgress(o)
+		case "E":
+			wa := o.GetStatus().GetWorkerAssignment()
+			if wa.GetWorkerPod() == "" {
+				m.setStatus("actor is "+explain.ActorState(o.GetStatus().GetState())+" and not on a worker pod", true)
+				return nil
+			}
+			return m.openEvents(wa.GetWorkerNamespace(), wa.GetWorkerPod())
 		case "T":
 			m.openTimeline(r.id)
 			return nil
@@ -186,6 +198,12 @@ func (m *Model) keyRow(key string, r *row) tea.Cmd {
 			return m.gotoKind(kAssignments, "")
 		case "p":
 			return m.gotoKind(kWorkerPools, o.GetWorkerPool())
+		case "E":
+			if o.GetWorkerPod() == "" {
+				m.setStatus("worker has no pod", true)
+				return nil
+			}
+			return m.openEvents(o.GetWorkerNamespace(), o.GetWorkerPod())
 		}
 	case *ateapi.ActorTemplate:
 		if key == "enter" {
@@ -320,7 +338,7 @@ func (m *Model) keyCommand(msg tea.KeyMsg) tea.Cmd {
 	return nil
 }
 
-var builtinCommands = []string{"quit", "help", "timeline", "journal", "all"}
+var builtinCommands = []string{"quit", "help", "pulse", "access", "timeline", "journal", "all"}
 
 // updateSuggestions completes the word under the cursor: a kind or command
 // first, then an atespace name.
@@ -402,7 +420,7 @@ func (m *Model) isCommand(in string) bool {
 		return false
 	}
 	switch fields[0] {
-	case "q", "q!", "quit", "exit", "help", "h", "timeline", "events", "journal", "all":
+	case "q", "q!", "quit", "exit", "help", "h", "pulse", "access", "timeline", "events", "journal", "all":
 		return true
 	}
 	return lookupKind(fields[0]) != nil
@@ -419,11 +437,22 @@ func (m *Model) runCommand(in string) tea.Cmd {
 	case "help", "h":
 		m.openHelp()
 		return nil
-	case "timeline", "events":
+	case "timeline":
 		m.openTimeline("")
+		return nil
+	case "events":
+		// Same as E on the selected actor or worker.
+		if r := m.selected(); r != nil {
+			return m.keyRow("E", r)
+		}
+		m.setStatus("select an actor or worker to see its pod's events", true)
 		return nil
 	case "journal":
 		return m.openJournal()
+	case "pulse":
+		return m.openPulse()
+	case "access":
+		return m.openAccess()
 	case "all":
 		return m.setAtespace("")
 	}
@@ -447,7 +476,18 @@ func (m *Model) runCommand(in string) tea.Cmd {
 
 func (m *Model) keyPager(msg tea.KeyMsg) tea.Cmd {
 	p := m.pager
+	if m.logs != nil && m.keyLogs(msg) {
+		return nil
+	}
+	if p.items != nil {
+		if ok, cmd := m.keyRelations(msg.String()); ok {
+			return cmd
+		}
+	}
 	h := m.pagerHeight()
+	if p.raw {
+		h = m.pulseHeight()
+	}
 	switch msg.String() {
 	case "esc", "q":
 		m.closePager()

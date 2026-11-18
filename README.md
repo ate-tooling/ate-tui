@@ -58,7 +58,7 @@ The header then shows `[write]`. `--demo` allows writes only with `--write`.
 
 | Key | Action |
 | --- | --- |
-| `:` | command palette: `:actors [atespace]`, `:workers`, `:templates`, `:workerpools`, `:atespaces`, `:tags`, `:timeline`, `:journal`, `:q` |
+| `:` | command palette: `:actors [atespace]`, `:workers`, `:templates`, `:workerpools`, `:atespaces`, `:tags`, `:pulse`, `:access`, `:timeline`, `:journal`, `:q` |
 | `/` | filter (space = AND, `!term` = NOT); `esc` clears |
 | `ctrl-z` | faults only: crashed, stuck, draining, full, not ready |
 | `tab` / `shift-tab` | cycle views |
@@ -68,7 +68,10 @@ The header then shows `[write]`. `--demo` allows writes only with `--write`.
 | `⏎` | actor: explain · worker: assignments · template: its actors · atespace: its actors · pool: its workers |
 | `X` | explain (actors, workers, templates, pools) |
 | `y` | yaml |
-| `l` | follow actor logs from its worker pod (`f` toggles follow) |
+| `l` | follow actor logs across worker moves (see [Logs](#logs)) |
+| `u` | relations of any row; `⏎` jumps to one (see [Diagnosis](#diagnosis)) |
+| `e` | actor: egress policy |
+| `E` | actor or worker: Kubernetes events of the worker pod |
 | `T` | actor timeline of state changes seen this session |
 | `o` / `t` / `p` | jump to worker / template / pool |
 | `r` | refresh now, or reconnect |
@@ -81,6 +84,58 @@ The header then shows `[write]`. `--demo` allows writes only with `--write`.
 | `A` / `U` | worker: mark available / unavailable |
 | `?` | help |
 
+## Logs
+
+`l` follows an actor the way `kubectl ate logs -f` does. Each poll reads the
+actor with `GetActor`:
+
+- When it moves to another worker pod, the old stream is closed and one opens
+  on the new pod, after a `── moved to <ns>/<pod> ──` line.
+- While it is not running, the pager shows `waiting: actor is Suspended`, once
+  per state, and reconnects when the actor runs again.
+- A reconnect to the same pod resumes from the kubelet timestamp of the last
+  line shown (`Timestamps` and `SinceTime`), so no line appears twice.
+
+Inside the pager:
+
+| Key | Action |
+| --- | --- |
+| `f` | toggle follow; scrolling up pauses it |
+| `/` | search; `n` / `N` next / previous match; `esc` clears |
+| `c` | source: all → containers → lifecycle |
+| `w` | toggle line wrap |
+
+The pager keeps the last 20,000 lines.
+In `--demo`, the actor named `…-nomad` moves between two workers, with a
+suspended pause in between, so you can watch this happen.
+
+## Diagnosis
+
+- **`u` relations:**
+  - actor: its template, source tag, golden tag, worker, pool and node;
+  - worker: its pool, node and assigned actors;
+  - template: its golden tag and actors;
+  - pool: its workers;
+  - atespace: its actors, templates and tags.
+
+  `⏎` opens the object's view with the cursor on it. A node opens the workers
+  on that node.
+- **`:pulse`:** a cluster overview that refreshes on each poll. It shows
+  actor counts by state per atespace, worker slot, CPU and memory use per
+  pool, WorkerPool readiness, recent crashes, actors stuck over 2 minutes,
+  and template golden snapshot errors. It reuses the all-atespace actors,
+  workers, pools and templates lists, fetched in parallel.
+- **`e` egress:** the actor's `EgressPolicy` rules, with protocol, hosts,
+  ports (proto defaults: http 80, https 443) and the names of injected
+  credential headers. Credential URIs and prefixes are never shown. An actor
+  with no policy has all egress denied, and its DNS lookups answer NXDOMAIN.
+- **`:access`:** global and per-atespace `AccessPolicy` bindings (role →
+  members). ateapi has no can-i RPC, so ate-tui shows the bindings and does
+  not predict permissions. The server's bootstrap owners are global owners
+  whether or not the global policy exists.
+- **`E` events:** core/v1 events for the worker pod hosting the actor, or the
+  selected worker's pod (field selector `involvedObject.name`), newest first.
+
 ## Explain
 
 `X` diagnoses from ateapi data alone:
@@ -88,8 +143,10 @@ The header then shows `[write]`. `--demo` allows writes only with `--write`.
 - **Actors:** crash message and time, and transitions stuck for over 2 minutes.
   It also shows snapshot generations and whether one is durable, the assigned
   worker's state, and whether any worker matching the selector has a free slot.
-  Template golden snapshot errors appear here too.
-- **Workers:** state, slot and resource use, epoch lag, and assignments.
+  Template golden snapshot errors appear here too, and so do Warning events
+  from the last hour on the hosting worker pod.
+- **Workers:** state, slot and resource use, epoch lag, assignments, and
+  recent Warning events on the worker pod.
 - **Templates:** golden snapshot status and the actor states built from the template.
 - **WorkerPools:** ready replicas, sandbox class resolution, and how many workers registered.
 
@@ -108,7 +165,8 @@ cmd/ate-tui        flags, wiring
 internal/ateconn   port-forward, trust bundle, token, paged List calls, writes
 internal/config    config.yaml (write allowlist), XDG paths
 internal/explain   pure diagnosis functions (tested)
-internal/ui        model, views, keys, pager (yaml/explain/logs/timeline/journal),
+internal/ui        model, views, keys, pager (yaml/explain/timeline/journal),
+                   logs follow, relations, pulse, policies and events,
                    actions and the confirm dialog
 internal/demo      in-memory backend for --demo
 ```

@@ -1,9 +1,7 @@
 package ui
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -28,6 +26,13 @@ type pager struct {
 	gen     int
 	// reload refreshes the content on each tick; nil for static views.
 	reload func() tea.Cmd
+	// resize redraws width-dependent content.
+	resize func()
+	// raw lines are drawn full width with no box around them (:pulse).
+	raw bool
+	// items make the pager a list with a cursor (relations); nil otherwise.
+	items  []relation
+	cursor int
 }
 
 type pagerMsg struct {
@@ -38,20 +43,6 @@ type pagerMsg struct {
 
 func (p *pager) setLines(lines []string, h int) {
 	p.lines = lines
-	if p.follow {
-		p.offset = len(p.lines)
-	}
-	p.scroll(0, h)
-}
-
-const maxLogLines = 20000
-
-func (p *pager) appendLines(lines []string, h int) {
-	p.lines = append(p.lines, lines...)
-	if over := len(p.lines) - maxLogLines; over > 0 {
-		p.lines = append(p.lines[:0], p.lines[over:]...)
-		p.offset -= over
-	}
 	if p.follow {
 		p.offset = len(p.lines)
 	}
@@ -82,10 +73,10 @@ func (m *Model) newPager(title string) *pager {
 
 func (m *Model) closePager() {
 	if m.logs != nil {
-		m.logs.cancel()
+		m.logs.stop()
 		m.logs = nil
 	}
-	m.pager = nil
+	m.pager, m.pulse = nil, nil
 }
 
 // lookup finds the freshest copy of a row so live views follow updates.
@@ -187,6 +178,14 @@ func buildReport(ctx context.Context, b Backend, obj any) (explain.Report, error
 	case *ateapi.Actor:
 		in := explain.ActorInput{Actor: o, Now: now}
 		var wg sync.WaitGroup
+		// Events are optional: a failure leaves them out of the report.
+		if wa := o.GetStatus().GetWorkerAssignment(); wa.GetWorkerPod() != "" {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				in.PodEvents, _ = b.PodEvents(ctx, wa.GetWorkerNamespace(), wa.GetWorkerPod())
+			}()
+		}
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
@@ -199,11 +198,25 @@ func buildReport(ctx context.Context, b Backend, obj any) (explain.Report, error
 		wg.Wait()
 		return explain.Actor(in), nil
 	case *ateapi.Worker:
-		as, err := b.ListWorkerAssignments(ctx, o.GetMetadata().GetName())
+		in := explain.WorkerInput{Worker: o, Now: now}
+		var err error
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			in.Assignments, err = b.ListWorkerAssignments(ctx, o.GetMetadata().GetName())
+		}()
+		go func() {
+			defer wg.Done()
+			if o.GetWorkerPod() != "" {
+				in.PodEvents, _ = b.PodEvents(ctx, o.GetWorkerNamespace(), o.GetWorkerPod())
+			}
+		}()
+		wg.Wait()
 		if err != nil {
 			return explain.Report{}, err
 		}
-		return explain.Worker(explain.WorkerInput{Worker: o, Assignments: as, Now: now}), nil
+		return explain.Worker(in), nil
 	case *ateapi.ActorTemplate:
 		as, err := b.ListActors(ctx, o.GetMetadata().GetAtespace())
 		if err != nil {
@@ -320,14 +333,27 @@ func (m *Model) openHelp() {
 		{"Actors", []hint{
 			{"⏎ / X", "explain: state, crash, snapshots, placement, template"},
 			{"y", "yaml"},
-			{"l", "follow logs from the actor's worker pod (f toggles follow)"},
+			{"l", "follow logs across worker moves, like kubectl ate logs -f"},
+			{"e", "egress policy: rules, hosts, ports, injected header names"},
 			{"T", "timeline of state changes seen by ate-tui; :timeline for all"},
 			{"o / t", "jump to worker / template"},
 		}},
+		{"Logs", []hint{
+			{"f", "toggle follow; scrolling up pauses it"},
+			{"/  n  N", "search, next / previous match; esc clears"},
+			{"c", "source: all → containers → lifecycle"},
+			{"w", "toggle line wrap"},
+		}},
 		{"Workers & pools", []hint{
 			{"⏎", "worker: actor assignments · pool: its workers"},
-			{"X", "explain capacity, epochs, sandbox config"},
+			{"X", "explain capacity, epochs, sandbox config, pod Warning events"},
 			{"p", "worker: jump to its pool"},
+		}},
+		{"Diagnosis", []hint{
+			{"u", "relations of any row: template, tags, worker, pool, node, actors; ⏎ jumps"},
+			{"E", "Kubernetes events of the worker pod (actor or worker)"},
+			{":pulse", "cluster overview: actor states, slots, pools, crashes, stuck, golden errors"},
+			{":access", "global and atespace access policy bindings (no permission prediction)"},
 		}},
 		{"Actions (need --write or writeContexts in the config)", []hint{
 			{"space", "mark / unmark a row; actions apply to marked rows, or the current one"},
@@ -349,139 +375,4 @@ func (m *Model) openHelp() {
 		lines = append(lines, "")
 	}
 	p.setLines(lines, m.pagerHeight())
-}
-
-// logStream follows one actor's lines from its worker pod.
-type logStream struct {
-	gen    int
-	ch     chan string
-	cancel context.CancelFunc
-}
-
-type logChunkMsg struct {
-	gen   int
-	lines []string
-	done  bool
-}
-
-// wait blocks off the UI goroutine for the next lines, then drains whatever
-// else is buffered so a burst renders in one frame.
-func (s *logStream) wait() tea.Cmd {
-	ch, gen := s.ch, s.gen
-	return func() tea.Msg {
-		l, ok := <-ch
-		if !ok {
-			return logChunkMsg{gen: gen, done: true}
-		}
-		lines := []string{l}
-		for len(lines) < 2000 {
-			select {
-			case l, ok := <-ch:
-				if !ok {
-					return logChunkMsg{gen: gen, lines: lines, done: true}
-				}
-				lines = append(lines, l)
-			default:
-				return logChunkMsg{gen: gen, lines: lines}
-			}
-		}
-		return logChunkMsg{gen: gen, lines: lines}
-	}
-}
-
-func (m *Model) openLogs(a *ateapi.Actor) tea.Cmd {
-	md := a.GetMetadata()
-	id := md.GetAtespace() + "/" + md.GetName()
-	p := m.newPager(stTitleKind.Render("logs") + " " + stTitleCount.Render(id))
-	p.follow = true
-	wa := a.GetStatus().GetWorkerAssignment()
-	if a.GetStatus().GetState() != ateapi.ActorState_ACTOR_STATE_RUNNING || wa.GetWorkerPod() == "" {
-		p.loading = false
-		p.setLines([]string{stDim.Render("actor is " + explain.ActorState(a.GetStatus().GetState()) + " and not on a worker; logs are only available while it runs")}, m.pagerHeight())
-		return nil
-	}
-	p.lines = nil
-	p.title += stDim.Render("  " + wa.GetWorkerNamespace() + "/" + wa.GetWorkerPod())
-
-	ctx, cancel := context.WithCancel(context.Background())
-	s := &logStream{gen: p.gen, ch: make(chan string, 4096), cancel: cancel}
-	m.logs = s
-	b := m.backend
-	go func() {
-		defer close(s.ch)
-		send := func(l string) bool {
-			select {
-			case s.ch <- l:
-				return true
-			case <-ctx.Done():
-				return false
-			}
-		}
-		rc, err := b.PodLogs(ctx, wa.GetWorkerNamespace(), wa.GetWorkerPod(), true, 5000)
-		if err != nil {
-			send(stStatusErr.Render("logs: " + err.Error()))
-			return
-		}
-		defer rc.Close()
-		sc := bufio.NewScanner(rc)
-		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		for sc.Scan() {
-			if l, ok := formatLogLine(sc.Bytes(), md.GetAtespace(), md.GetName()); ok && !send(l) {
-				return
-			}
-		}
-		if err := sc.Err(); err != nil && ctx.Err() == nil {
-			send(stStatusErr.Render("logs: " + err.Error()))
-		}
-	}()
-	return s.wait()
-}
-
-// Log label keys from go.ate.dev/substrate/internal/ateattr.
-const (
-	labelAtespace  = "ate.atespace"
-	labelActor     = "ate.actor.name"
-	labelContainer = "ate.actor.container.name"
-	sandboxID      = "_sandbox"
-)
-
-// formatLogLine keeps lines the worker attributes to this actor. A worker pod
-// can host several actors over time, so lines must match both labels.
-func formatLogLine(b []byte, atespace, name string) (string, bool) {
-	var m map[string]any
-	if json.Unmarshal(b, &m) != nil {
-		return "", false
-	}
-	var labels map[string]any
-	for _, k := range []string{"logging.googleapis.com/labels", "labels"} {
-		if l, ok := m[k].(map[string]any); ok {
-			labels = l
-			break
-		}
-	}
-	if labels[labelActor] != name || labels[labelAtespace] != atespace {
-		return "", false
-	}
-	container, _ := labels[labelContainer].(string)
-	if container == sandboxID {
-		return "", false
-	}
-	msg, _ := m["message"].(string)
-	if msg == "" {
-		msg, _ = m["msg"].(string)
-	}
-	ts := ""
-	for _, k := range []string{"time", "timestamp", "ts"} {
-		if s, ok := m[k].(string); ok {
-			if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
-				ts = t.Local().Format("15:04:05")
-			}
-			break
-		}
-	}
-	src := stLogLifecycle.Render("lifecycle")
-	if container != "" {
-		src = stLogContainer.Render(container)
-	}
-	return stLogTime.Render(ts) + " " + src + " " + msg, true
 }

@@ -73,6 +73,9 @@ func fit(s string, w int) string {
 func box(title string, lines []string, width, height int, border lipgloss.Style) []string {
 	inner := width - 2
 	out := make([]string, 0, height+2)
+	if lipgloss.Width(title) > inner-3 {
+		title = ansi.Truncate(title, max(inner-3, 0), "…")
+	}
 	tw := lipgloss.Width(title)
 	rest := max(inner-tw-2, 0)
 	out = append(out, border.Render("╭ ")+title+border.Render(" "+strings.Repeat("─", rest)+"╮"))
@@ -288,10 +291,26 @@ func centered(s string, w int) string {
 
 func (m *Model) viewPager() []string {
 	p := m.pager
+	if p.raw {
+		h := m.pulseHeight()
+		end := min(p.offset+h, len(p.lines))
+		out := make([]string, h)
+		for i := range out {
+			l := ""
+			if p.offset+i < end {
+				l = p.lines[p.offset+i]
+			}
+			out[i] = fit(l, m.width)
+		}
+		return out
+	}
 	h := m.pagerHeight()
 	end := min(p.offset+h, len(p.lines))
 	lines := p.lines[p.offset:end]
 	title := p.title
+	if m.logs != nil {
+		title = m.logTitle()
+	}
 	if len(p.lines) > h {
 		title += stDim.Render(fmt.Sprintf(" %d-%d/%d", p.offset+1, end, len(p.lines)))
 	}
@@ -310,8 +329,14 @@ func (m *Model) viewFooter() []string {
 	switch m.mode {
 	case modePager:
 		hints = []hint{{"esc", "back"}, {"j/k", "scroll"}, {"g/G", "top/bottom"}}
-		if m.logs != nil {
-			hints = append(hints, hint{"f", "follow"})
+		switch {
+		case m.logs != nil && m.logs.searching:
+			hints = []hint{{"⏎", "search"}, {"esc", "cancel"}}
+		case m.logs != nil:
+			hints = append(hints, hint{"f", "follow"}, hint{"/", "search"}, hint{"n/N", "next/prev"},
+				hint{"c", "source"}, hint{"w", "wrap"})
+		case m.pager != nil && m.pager.items != nil:
+			hints = []hint{{"esc", "back"}, {"j/k", "move"}, {"⏎", "jump"}}
 		}
 		hints = append(hints, hint{":", "resource"}, hint{"?", "help"})
 	case modeFilter:

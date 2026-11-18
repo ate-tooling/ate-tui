@@ -100,6 +100,9 @@ type Model struct {
 
 	pager *pager
 	logs  *logStream
+	pulse *pulseData
+	// want is where a relation jump puts the cursor once the row is listed.
+	want wantRow
 
 	timeline  []tlEvent
 	lastState map[string]string
@@ -229,16 +232,32 @@ func (m *Model) setView(k viewKey, pushHistory bool) tea.Cmd {
 		clear(m.table().marked)
 	}
 	m.cur = k
+	if m.want.key != k {
+		m.want = wantRow{}
+	}
 	if pushHistory {
 		m.history = append(m.history[:m.histIdx+1], k)
 		m.histIdx = len(m.history) - 1
 	}
 	t := m.table()
 	if d := m.data[k]; d != nil {
-		t.rebuild(d.rows, m.def().columns, m.selectedID())
+		t.rebuild(d.rows, m.def().columns, m.keepID(m.selectedID()))
+		t.clamp(m.tableHeight())
+		if m.selectedID() == m.want.id {
+			m.want = wantRow{}
+		}
 	}
 	m.setStatus("Viewing "+string(k.kind), false)
 	return m.fetch(k)
+}
+
+// keepID is the row the cursor should stay on: a pending jump's target in
+// this view, or the current row.
+func (m *Model) keepID(cur string) string {
+	if m.want.id != "" && m.want.key == m.cur {
+		return m.want.id
+	}
+	return cur
 }
 
 func (m *Model) gotoKind(k kind, filter string) tea.Cmd {
@@ -283,8 +302,15 @@ func (m *Model) selectedID() string {
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		resized := msg.Width != m.width
 		m.width, m.height = msg.Width, msg.Height
 		m.table().clamp(m.tableHeight())
+		if resized && m.logs != nil && m.logs.wrap {
+			m.rebuildLogs()
+		}
+		if m.pager != nil && m.pager.resize != nil {
+			m.pager.resize()
+		}
 		return m, nil
 
 	case connectedMsg:
@@ -302,6 +328,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.fetch(viewKey{kWorkers, ""}), m.fetch(viewKey{kActors, m.atespace}))
 
 	case fetchedMsg:
+		var cmd tea.Cmd
 		d := m.ds(msg.key)
 		if msg.gen != d.gen {
 			return m, nil
@@ -310,7 +337,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// the same object after the refresh.
 		keep := ""
 		if msg.key == m.cur {
-			keep = m.selectedID()
+			keep = m.keepID(m.selectedID())
 		}
 		d.loading = false
 		d.fetchedAt = msg.at
@@ -320,6 +347,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.key.kind == kActors {
 				m.recordTimeline(msg.rows, msg.at)
 			}
+		}
+		if m.pulse != nil && pulseKeys[msg.key] {
+			cmd = m.pulseRefresh()
 		}
 		if msg.key == m.cur {
 			if msg.err != nil {
@@ -331,8 +361,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			t := m.table()
 			t.rebuild(d.rows, m.def().columns, keep)
 			t.clamp(m.tableHeight())
+			if m.want.id != "" && m.selectedID() == m.want.id {
+				m.want = wantRow{}
+			}
 		}
-		return m, nil
+		return m, cmd
 
 	case tickMsg:
 		cmds := []tea.Cmd{m.tick()}
@@ -341,6 +374,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.pager != nil && m.pager.reload != nil && !m.pager.loading {
 				cmds = append(cmds, m.pager.reload())
 			}
+			cmds = append(cmds, m.pollLogActor())
 		}
 		return m, tea.Batch(cmds...)
 
@@ -357,15 +391,18 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case logChunkMsg:
-		if m.pager == nil || m.logs == nil || msg.gen != m.logs.gen {
-			return m, nil
-		}
-		m.pager.appendLines(msg.lines, m.pagerHeight())
-		if msg.done {
-			m.pager.title += stDim.Render("  (stream ended)")
-			return m, nil
-		}
-		return m, m.logs.wait()
+		return m, m.logChunk(msg)
+
+	case logActorMsg:
+		return m, m.logActor(msg)
+
+	case relationsMsg:
+		m.relationsLoaded(msg)
+		return m, nil
+
+	case pulseMsg:
+		m.pulseLoaded(msg)
+		return m, nil
 
 	case actionResultMsg:
 		return m, m.actionResult(msg)

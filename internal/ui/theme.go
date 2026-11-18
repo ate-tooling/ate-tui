@@ -67,6 +67,7 @@ var (
 	stLogLifecycle = fg(cMauve)
 	stLogTime      = fg(cOverlay1)
 	stMark         = fg(cPink)
+	stMatch        = lipgloss.NewStyle().Background(cYellow).Foreground(cBase)
 )
 
 // rowLevel picks a row's color, mirroring sofka: healthy rows blue, errors

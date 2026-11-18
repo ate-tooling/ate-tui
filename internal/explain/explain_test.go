@@ -8,6 +8,8 @@ import (
 
 	ateapi "go.ate.dev/substrate/api/ateapi/v1"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 var now = time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
@@ -150,6 +152,43 @@ func TestActor(t *testing.T) {
 				t.Errorf("no %v finding containing %q in %+v", tt.level, tt.finding, r.Findings)
 			}
 		})
+	}
+}
+
+func TestPodWarningEvents(t *testing.T) {
+	ev := func(typ, reason string, ago time.Duration) corev1.Event {
+		return corev1.Event{Type: typ, Reason: reason, Message: reason + " message", Count: 2, LastTimestamp: metav1.NewTime(now.Add(-ago))}
+	}
+	running := actor(ateapi.ActorState_ACTOR_STATE_RUNNING, time.Minute, func(a *ateapi.Actor) {
+		a.Status.WorkerAssignment = &ateapi.WorkerAssignment{Worker: &ateapi.ObjectRef{Name: "w1"}, WorkerNamespace: "ns", WorkerPod: "w1-pod"}
+	})
+	tests := []struct {
+		name   string
+		events []corev1.Event
+		warn   bool
+	}{
+		{"none fetched", nil, false},
+		{"normal only", []corev1.Event{ev(corev1.EventTypeNormal, "Started", time.Minute)}, false},
+		{"old warning", []corev1.Event{ev(corev1.EventTypeWarning, "BackOff", 2*time.Hour)}, false},
+		{"recent warning", []corev1.Event{ev(corev1.EventTypeNormal, "Started", time.Minute), ev(corev1.EventTypeWarning, "Unhealthy", 4*time.Minute)}, true},
+	}
+	for _, tt := range tests {
+		r := Actor(ActorInput{Actor: running, PodEvents: tt.events, Now: now})
+		if got := hasFinding(r, Warn, "Warning event(s) on worker pod ns/w1-pod"); got != tt.warn {
+			t.Errorf("actor, %s: warning finding %v, want %v: %+v", tt.name, got, tt.warn, r.Findings)
+		}
+		w := worker("w1", ateapi.WorkerState_WORKER_STATE_ACTIVE, 1, 4, nil)
+		w.WorkerNamespace = "ns"
+		r = Worker(WorkerInput{Worker: w, PodEvents: tt.events, Now: now})
+		if got := hasFinding(r, Warn, "Warning event(s)"); got != tt.warn {
+			t.Errorf("worker, %s: warning finding %v, want %v", tt.name, got, tt.warn)
+		}
+	}
+	r := Actor(ActorInput{Actor: running, PodEvents: tests[3].events, Now: now})
+	for _, f := range r.Findings {
+		if strings.Contains(f.Title, "Warning event") && (len(f.Detail) != 1 || f.Detail[0] != "Unhealthy x2, 4m ago: Unhealthy message") {
+			t.Errorf("detail %q", f.Detail)
+		}
 	}
 }
 

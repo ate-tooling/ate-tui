@@ -10,6 +10,7 @@ import (
 	"github.com/ate-tooling/ate-tui/internal/explain"
 	ateapi "go.ate.dev/substrate/api/ateapi/v1"
 	infrav1 "go.ate.dev/substrate/api/infra/k8s/ate/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -23,8 +24,13 @@ type Backend interface {
 	ListWorkers(ctx context.Context) ([]*ateapi.Worker, error)
 	ListWorkerAssignments(ctx context.Context, worker string) ([]*ateapi.ActorAssignment, error)
 	ListWorkerPools(ctx context.Context) ([]infrav1.WorkerPool, error)
+	GetActor(ctx context.Context, ref *ateapi.ObjectRef) (*ateapi.Actor, error)
 	GetActorTemplate(ctx context.Context, ref *ateapi.ObjectRef) (*ateapi.ActorTemplate, error)
-	PodLogs(ctx context.Context, namespace, pod string, follow bool, tail int64) (io.ReadCloser, error)
+	GetActorEgressPolicy(ctx context.Context, ref *ateapi.ObjectRef) (*ateapi.EgressPolicy, error)
+	GetGlobalAccessPolicy(ctx context.Context) (*ateapi.AccessPolicy, error)
+	GetAtespaceAccessPolicy(ctx context.Context, atespace string) (*ateapi.AccessPolicy, error)
+	PodLogs(ctx context.Context, namespace, pod string, opts *corev1.PodLogOptions) (io.ReadCloser, error)
+	PodEvents(ctx context.Context, namespace, pod string) ([]corev1.Event, error)
 
 	SuspendActor(ctx context.Context, ref *ateapi.ObjectRef, mode ateapi.DurabilityMode) (*ateapi.Actor, error)
 	ResumeActor(ctx context.Context, ref *ateapi.ObjectRef) (*ateapi.Actor, error)
@@ -68,9 +74,9 @@ var kinds = []*kindDef{
 		kind: kActors, aliases: []string{"actor", "act", "a"}, scoped: true,
 		columns: []string{"ATESPACE", "NAME", "STATE", "TEMPLATE", "WORKER", "NODE", "GEN", "UPDATED", "AGE"},
 		drop:    []int{6, 5, 7, 3},
-		hints: []hint{{"⏎", "explain"}, {"y", "yaml"}, {"l", "logs"}, {"T", "timeline"},
-			{"o", "worker"}, {"t", "template"}, {"␣", "mark"}, {"s", "suspend"}, {"R", "resume"},
-			{"v", "revert"}, {"^d", "delete"}},
+		hints: []hint{{"⏎", "explain"}, {"y", "yaml"}, {"l", "logs"}, {"u", "relations"}, {"e", "egress"},
+			{"E", "events"}, {"T", "timeline"}, {"o", "worker"}, {"t", "template"}, {"␣", "mark"},
+			{"s", "suspend"}, {"R", "resume"}, {"v", "revert"}, {"^d", "delete"}},
 		fetch: func(ctx context.Context, b Backend, scope string, now time.Time) ([]row, error) {
 			as, err := b.ListActors(ctx, scope)
 			if err != nil {
@@ -87,8 +93,9 @@ var kinds = []*kindDef{
 		kind: kWorkers, aliases: []string{"worker", "wk", "w"},
 		columns: []string{"NAME", "STATE", "POOL", "NODE", "ACTORS", "CPU", "MEM", "POD", "AGE"},
 		drop:    []int{7, 6, 5, 3},
-		hints: []hint{{"⏎", "assignments"}, {"y", "yaml"}, {"X", "explain"}, {"p", "pool"},
-			{"␣", "mark"}, {"D", "drain"}, {"A", "available"}, {"U", "unavailable"}},
+		hints: []hint{{"⏎", "assignments"}, {"y", "yaml"}, {"X", "explain"}, {"u", "relations"},
+			{"E", "events"}, {"p", "pool"}, {"␣", "mark"}, {"D", "drain"}, {"A", "available"},
+			{"U", "unavailable"}},
 		fetch: func(ctx context.Context, b Backend, _ string, now time.Time) ([]row, error) {
 			ws, err := b.ListWorkers(ctx)
 			if err != nil {
@@ -105,7 +112,7 @@ var kinds = []*kindDef{
 		kind: kTemplates, aliases: []string{"template", "actortemplates", "actortemplate", "tpl"}, scoped: true,
 		columns: []string{"ATESPACE", "NAME", "IMAGES", "CPU", "MEM", "GOLDEN", "AGE"},
 		drop:    []int{4, 3, 2},
-		hints:   []hint{{"⏎", "actors"}, {"y", "yaml"}, {"X", "explain"}},
+		hints:   []hint{{"⏎", "actors"}, {"y", "yaml"}, {"X", "explain"}, {"u", "relations"}},
 		fetch: func(ctx context.Context, b Backend, scope string, now time.Time) ([]row, error) {
 			ts, err := b.ListActorTemplates(ctx, scope)
 			if err != nil {
@@ -122,7 +129,7 @@ var kinds = []*kindDef{
 		kind: kAtespaces, aliases: []string{"atespace", "as", "ns"},
 		columns: []string{"NAME", "UID", "AGE"},
 		drop:    []int{1},
-		hints:   []hint{{"⏎", "actors"}, {"y", "yaml"}},
+		hints:   []hint{{"⏎", "actors"}, {"y", "yaml"}, {"u", "relations"}},
 		fetch: func(ctx context.Context, b Backend, _ string, now time.Time) ([]row, error) {
 			as, err := b.ListAtespaces(ctx)
 			if err != nil {
@@ -142,7 +149,7 @@ var kinds = []*kindDef{
 		kind: kTags, aliases: []string{"tag"}, scoped: true,
 		columns: []string{"ATESPACE", "NAME", "SCOPE", "SOURCE", "GEN", "FIDELITY", "AGE"},
 		drop:    []int{5, 3},
-		hints:   []hint{{"y", "yaml"}},
+		hints:   []hint{{"y", "yaml"}, {"u", "relations"}},
 		fetch: func(ctx context.Context, b Backend, scope string, now time.Time) ([]row, error) {
 			ts, err := b.ListTags(ctx, scope)
 			if err != nil {
@@ -168,7 +175,7 @@ var kinds = []*kindDef{
 		kind: kWorkerPools, aliases: []string{"workerpool", "wp", "pools", "pool"},
 		columns: []string{"NAMESPACE", "NAME", "DESIRED", "CURRENT", "READY", "SANDBOX", "AGE"},
 		drop:    []int{3, 2, 5},
-		hints:   []hint{{"⏎", "workers"}, {"y", "yaml"}, {"X", "explain"}},
+		hints:   []hint{{"⏎", "workers"}, {"y", "yaml"}, {"X", "explain"}, {"u", "relations"}},
 		fetch: func(ctx context.Context, b Backend, _ string, now time.Time) ([]row, error) {
 			ps, err := b.ListWorkerPools(ctx)
 			if err != nil {
@@ -184,7 +191,7 @@ var kinds = []*kindDef{
 	{
 		kind: kAssignments, aliases: []string{"assignment"},
 		columns: []string{"ATESPACE", "ACTOR", "CPU", "MEM", "AGE"},
-		hints:   []hint{{"⏎", "actor"}, {"y", "yaml"}},
+		hints:   []hint{{"⏎", "actor"}, {"y", "yaml"}, {"u", "relations"}},
 		fetch: func(ctx context.Context, b Backend, worker string, now time.Time) ([]row, error) {
 			if worker == "" {
 				return nil, fmt.Errorf("pick a worker and press ⏎ to list its assignments")

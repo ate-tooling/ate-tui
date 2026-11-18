@@ -9,6 +9,7 @@ import (
 	infrav1 "go.ate.dev/substrate/api/infra/k8s/ate/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 )
 
 const pageSize = 500
@@ -115,8 +116,44 @@ func (c *Conn) ListWorkerPools(ctx context.Context) ([]infrav1.WorkerPool, error
 
 // PodLogs streams the logs of a worker pod. A worker pod hosts one actor at a
 // time but keeps earlier actors' lines, so callers filter by actor labels.
-func (c *Conn) PodLogs(ctx context.Context, namespace, pod string, follow bool, tail int64) (io.ReadCloser, error) {
-	return c.Kube.CoreV1().Pods(namespace).GetLogs(pod, &corev1.PodLogOptions{Follow: follow, TailLines: &tail}).Stream(ctx)
+func (c *Conn) PodLogs(ctx context.Context, namespace, pod string, opts *corev1.PodLogOptions) (io.ReadCloser, error) {
+	return c.Kube.CoreV1().Pods(namespace).GetLogs(pod, opts).Stream(ctx)
+}
+
+// PodEvents lists the core/v1 events about a pod, as kubectl describe does.
+func (c *Conn) PodEvents(ctx context.Context, namespace, pod string) ([]corev1.Event, error) {
+	l, err := c.Kube.CoreV1().Events(namespace).List(ctx, metav1.ListOptions{
+		FieldSelector: fields.AndSelectors(
+			fields.OneTermEqualSelector("involvedObject.name", pod),
+			fields.OneTermEqualSelector("involvedObject.kind", "Pod"),
+		).String(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return l.Items, nil
+}
+
+func (c *Conn) GetActor(ctx context.Context, ref *ateapi.ObjectRef) (*ateapi.Actor, error) {
+	return c.Control.GetActor(ctx, &ateapi.GetActorRequest{Actor: ref})
+}
+
+// singleton is the only name ateapi accepts for an EgressPolicy or an
+// AccessPolicy.
+const singleton = "default"
+
+func (c *Conn) GetActorEgressPolicy(ctx context.Context, ref *ateapi.ObjectRef) (*ateapi.EgressPolicy, error) {
+	return c.Control.GetActorEgressPolicy(ctx, &ateapi.GetActorEgressPolicyRequest{Actor: ref, Name: singleton})
+}
+
+func (c *Conn) GetGlobalAccessPolicy(ctx context.Context) (*ateapi.AccessPolicy, error) {
+	return c.Control.GetGlobalAccessPolicy(ctx, &ateapi.GetGlobalAccessPolicyRequest{Name: singleton})
+}
+
+func (c *Conn) GetAtespaceAccessPolicy(ctx context.Context, atespace string) (*ateapi.AccessPolicy, error) {
+	return c.Control.GetAtespaceAccessPolicy(ctx, &ateapi.GetAtespaceAccessPolicyRequest{
+		Atespace: &ateapi.ObjectRef{Name: atespace}, Name: singleton,
+	})
 }
 
 // Writes. Each is one RPC; the UI gates them behind --write and a confirm.

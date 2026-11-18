@@ -16,7 +16,7 @@ in config, and every write asks for confirmation.
   PermissionDenied and FailedPrecondition show as plain messages.
 - `:journal` keeps a local log of actions and their results.
 
-## Milestone 3: Deeper diagnosis
+## Milestone 3 (done): Deeper diagnosis
 
 - Logs follow the actor across worker migration (like `kubectl ate logs -f`),
   with search, a container/lifecycle filter and line wrap.
