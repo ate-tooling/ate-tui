@@ -3,7 +3,7 @@
 Milestone 1 (done): read-only browser, explain, logs, timeline, palette,
 filter, faults, async cached views, `--demo`.
 
-## Milestone 2: Actions with safety
+## Milestone 2 (done): Actions with safety
 
 Read-only stays the default. Writes need `--write` or a per-context allowlist
 in config, and every write asks for confirmation.

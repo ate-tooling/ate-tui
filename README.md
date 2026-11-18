@@ -13,6 +13,7 @@ ate-tui                 # current kubeconfig context, all atespaces
 ate-tui -a research     # start in one atespace
 ate-tui workers         # start on a view
 ate-tui --demo          # sample data, no cluster needed
+ate-tui --write         # allow actions (each still asks to confirm)
 ```
 
 ## Connecting
@@ -28,13 +29,36 @@ ate-tui connects the way `kubectl ate` does:
 override the defaults, as they do for `kubectl ate`. WorkerPools and worker pod
 logs come from the Kubernetes API.
 
-ate-tui is read-only. It never calls a mutating RPC.
+## Safety
+
+ate-tui is read-only by default, and the header shows `[read-only]`. Writes
+are enabled by `--write`, or for chosen kube contexts by
+`~/.config/ate-tui/config.yaml` (`$XDG_CONFIG_HOME` is honored):
+
+```yaml
+writeContexts: [kind-dev, gke_my-project_us-central1_staging]
+```
+
+The header then shows `[write]`. `--demo` allows writes only with `--write`.
+
+- Every action opens a confirm dialog that lists the objects. `y`/`⏎`
+  accepts, `n`/`esc` cancels. Delete asks you to type the actor's name, or
+  `yes` when several are marked; nothing else works while that dialog is open.
+- `space` marks rows. Actions apply to the marked rows, or to the current row
+  when none are marked. Marks clear after an action or a view change.
+- Actions run in the background, in parallel. The row shows its new state at
+  once and a quick re-poll confirms it. The status line reports failures per
+  object, e.g. `suspended 3, failed 1: …`, with a hint for PermissionDenied
+  and Unauthenticated.
+- Each result is appended to `~/.local/state/ate-tui/journal.jsonl`
+  (`$XDG_STATE_HOME` is honored). `:journal` lists this session's actions
+  and earlier ones.
 
 ## Keys
 
 | Key | Action |
 | --- | --- |
-| `:` | command palette: `:actors [atespace]`, `:workers`, `:templates`, `:workerpools`, `:atespaces`, `:tags`, `:timeline`, `:q` |
+| `:` | command palette: `:actors [atespace]`, `:workers`, `:templates`, `:workerpools`, `:atespaces`, `:tags`, `:timeline`, `:journal`, `:q` |
 | `/` | filter (space = AND, `!term` = NOT); `esc` clears |
 | `ctrl-z` | faults only: crashed, stuck, draining, full, not ready |
 | `tab` / `shift-tab` | cycle views |
@@ -48,6 +72,13 @@ ate-tui is read-only. It never calls a mutating RPC.
 | `T` | actor timeline of state changes seen this session |
 | `o` / `t` / `p` | jump to worker / template / pool |
 | `r` | refresh now, or reconnect |
+| `space` | mark / unmark the row |
+| `s` | actor: suspend (`tab` in the dialog toggles async / sync durability; async is the default) |
+| `R` | actor: resume |
+| `v` | actor: revert to its durable snapshot (clears a crash) |
+| `ctrl-d` | actor: delete (type the name to confirm) |
+| `D` | worker: drain (one-way) |
+| `A` / `U` | worker: mark available / unavailable |
 | `?` | help |
 
 ## Explain
@@ -74,8 +105,10 @@ and a frame ~0.2ms (`go test ./internal/ui -bench .`).
 
 ```
 cmd/ate-tui        flags, wiring
-internal/ateconn   port-forward, trust bundle, token, paged List calls
+internal/ateconn   port-forward, trust bundle, token, paged List calls, writes
+internal/config    config.yaml (write allowlist), XDG paths
 internal/explain   pure diagnosis functions (tested)
-internal/ui        model, views, keys, pager (yaml/explain/logs/timeline)
+internal/ui        model, views, keys, pager (yaml/explain/logs/timeline/journal),
+                   actions and the confirm dialog
 internal/demo      in-memory backend for --demo
 ```

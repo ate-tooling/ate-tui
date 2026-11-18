@@ -171,7 +171,7 @@ func checkAssignedWorker(r *Report, wa *ateapi.WorkerAssignment, workers []*atea
 	}
 	switch w.GetStatus().GetState() {
 	case ateapi.WorkerState_WORKER_STATE_DRAINING:
-		r.add(Warn, "Worker "+name+" is draining", "the actor will be suspended and moved")
+		r.add(Warn, "Worker "+name+" is draining", "no new actors are placed there; this actor stays until it suspends")
 	case ateapi.WorkerState_WORKER_STATE_UNAVAILABLE:
 		r.add(Error, "Worker "+name+" is unavailable")
 	}
@@ -291,7 +291,7 @@ func Worker(in WorkerInput) Report {
 		r.add(OK, "Active")
 	case ateapi.WorkerState_WORKER_STATE_DRAINING:
 		r.Summary = "Worker is draining and accepts no new actors."
-		r.add(Warn, "Draining", "hosted actors are suspended and resume elsewhere")
+		r.add(Warn, "Draining", "no new actors are placed; bound actors stay until they suspend")
 	case ateapi.WorkerState_WORKER_STATE_UNAVAILABLE:
 		r.Summary = "Worker is unavailable."
 		r.add(Error, "Unavailable", "the scheduler places no actors here")

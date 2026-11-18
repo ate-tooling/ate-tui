@@ -40,6 +40,9 @@ func (m *Model) viewConfirm(maxH int) []string {
 	c := m.confirm
 	a := c.act
 	w := min(m.width-4, 72)
+	if w < 16 {
+		return nil // too narrow to draw; the footer still shows the keys
+	}
 	inner := w - 4
 	noun := string(c.key.kind)
 	if len(c.targets) == 1 {

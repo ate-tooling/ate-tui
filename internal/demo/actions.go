@@ -42,6 +42,14 @@ func (b *Backend) begin(a *ateapi.Actor, s ateapi.ActorState) {
 	a.Status.State = s
 	a.Metadata.UpdateTime = ts(time.Now())
 	b.pending[a] = settle
+	b.pinned[a] = true
+}
+
+// result returns a copy of a written actor. The random lifecycle leaves it
+// alone from now on, so only the user's writes move it.
+func (b *Backend) result(a *ateapi.Actor) (*ateapi.Actor, error) {
+	b.pinned[a] = true
+	return proto.Clone(a).(*ateapi.Actor), nil
 }
 
 func (b *Backend) busy(a *ateapi.Actor) error {
@@ -83,7 +91,7 @@ func (b *Backend) SuspendActor(_ context.Context, ref *ateapi.ObjectRef, mode at
 		return nil, status.Errorf(codes.FailedPrecondition, "actor %s/%s is %s; only a RUNNING actor can be suspended",
 			ref.GetAtespace(), ref.GetName(), stateName(a.Status.State))
 	}
-	return proto.Clone(a).(*ateapi.Actor), nil
+	return b.result(a)
 }
 
 func (b *Backend) ResumeActor(_ context.Context, ref *ateapi.ObjectRef) (*ateapi.Actor, error) {
@@ -108,7 +116,7 @@ func (b *Backend) ResumeActor(_ context.Context, ref *ateapi.ObjectRef) (*ateapi
 	default:
 		return nil, status.Errorf(codes.FailedPrecondition, "actor %s/%s is %s", ref.GetAtespace(), ref.GetName(), stateName(a.Status.State))
 	}
-	return proto.Clone(a).(*ateapi.Actor), nil
+	return b.result(a)
 }
 
 func (b *Backend) RevertActor(_ context.Context, ref *ateapi.ObjectRef) (*ateapi.Actor, error) {
@@ -136,7 +144,7 @@ func (b *Backend) RevertActor(_ context.Context, ref *ateapi.ObjectRef) (*ateapi
 	default:
 		return nil, status.Errorf(codes.FailedPrecondition, "actor %s/%s is %s", ref.GetAtespace(), ref.GetName(), stateName(a.Status.State))
 	}
-	return proto.Clone(a).(*ateapi.Actor), nil
+	return b.result(a)
 }
 
 func (b *Backend) DeleteActor(_ context.Context, ref *ateapi.ObjectRef) (*ateapi.Actor, error) {
@@ -148,10 +156,10 @@ func (b *Backend) DeleteActor(_ context.Context, ref *ateapi.ObjectRef) (*ateapi
 		return nil, err
 	}
 	if a.Status.State == ateapi.ActorState_ACTOR_STATE_DELETING {
-		return proto.Clone(a).(*ateapi.Actor), nil
+		return b.result(a)
 	}
 	b.begin(a, ateapi.ActorState_ACTOR_STATE_DELETING)
-	return proto.Clone(a).(*ateapi.Actor), nil
+	return b.result(a)
 }
 
 func (b *Backend) DrainWorker(_ context.Context, name string) (*ateapi.Worker, error) {
@@ -165,13 +173,8 @@ func (b *Backend) DrainWorker(_ context.Context, name string) (*ateapi.Worker, e
 	if w.Status.State != ateapi.WorkerState_WORKER_STATE_DRAINING {
 		w.Status.State = ateapi.WorkerState_WORKER_STATE_DRAINING
 		w.Metadata.UpdateTime = ts(time.Now())
-		// The drain controller suspends what the worker hosts.
-		for _, a := range b.actors {
-			if a.Status.GetWorkerAssignment().GetWorker().GetName() == name && b.busy(a) == nil &&
-				a.Status.State == ateapi.ActorState_ACTOR_STATE_RUNNING {
-				b.begin(a, ateapi.ActorState_ACTOR_STATE_SUSPENDING)
-			}
-		}
+		// Like ateapi, a drain leaves bound actors alone; it only stops new
+		// placements.
 	}
 	return proto.Clone(w).(*ateapi.Worker), nil
 }
