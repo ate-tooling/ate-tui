@@ -1,9 +1,18 @@
-# ate-tui
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/logo-dark.svg">
+    <img src="docs/images/logo.svg" alt="ate-tui logo: a green octopus in a terminal window" width="180">
+  </picture>
+</p>
+
+<h1 align="center">ate-tui</h1>
 
 A terminal UI for [Agent Substrate](https://ate.dev), in the style of
 [sofka](https://sofka.rs). It browses atespaces, actors, actor templates,
 tags, workers and WorkerPools live, and explains why an actor or worker is
 unhealthy.
+
+![A tour of ate-tui --demo: the actors table, explaining a crashed actor, the pulse overview, a worker's relations and following an actor's logs](docs/images/demo.gif)
 
 ```
 brew install ate-tooling/tap/ate-tui
@@ -111,6 +120,8 @@ The header then shows `[write]`. `--demo` allows writes only with `--write`.
 
 ## Keys
 
+![The actors view, with the key hints in the header](docs/images/actors.png)
+
 | Key | Action |
 | --- | --- |
 | `:` | command palette: `:actors [atespace]`, `:workers`, `:templates`, `:workerpools`, `:atespaces`, `:tags`, `:pulse`, `:access`, `:timeline`, `:journal`, `:pf`, `:ctx [name]`, `:q` |
@@ -147,6 +158,8 @@ The header then shows `[write]`. `--demo` allows writes only with `--write`.
 
 ## Logs
 
+![Logs following an actor across a move to another worker](docs/images/logs.png)
+
 `l` follows an actor the way `kubectl ate logs -f` does. Each poll reads the
 actor with `GetActor`:
 
@@ -171,6 +184,10 @@ In `--demo`, the actor named `…-nomad` moves between two workers, with a
 suspended pause in between, so you can watch this happen.
 
 ## Diagnosis
+
+![Relations of an actor: its template, golden tag, worker, pool and node](docs/images/relations.png)
+
+![Pulse: actor states per atespace, worker slots, pool readiness, recent crashes, stuck actors and golden snapshot errors](docs/images/pulse.png)
 
 - **`u` relations:**
   - actor: its template, source tag, golden tag, worker, pool and node;
@@ -198,6 +215,8 @@ suspended pause in between, so you can watch this happen.
   selected worker's pod (field selector `involvedObject.name`), newest first.
 
 ## Proxy
+
+![The proxy dialog, asking for local:remote ports](docs/images/proxy-dialog.png)
 
 `f` on an actor forwards local ports to it through atenet-router, as
 `kubectl ate proxy actor` does. The dialog takes `[local:]remote` specs,
@@ -245,6 +264,8 @@ and create it again.
 
 ## Explain
 
+![Explain on a crashed actor: the crash, and the kubectl ate commands to look further and revert it](docs/images/explain.png)
+
 `X` diagnoses from ateapi data alone:
 
 - **Actors:** crash message and time, and transitions stuck for over 2 minutes.
@@ -290,3 +311,11 @@ internal/ui        model, views, keys, pager (yaml/explain/timeline/journal),
                    actions and the confirm dialog
 internal/demo      in-memory backend for --demo
 ```
+
+## Credits
+
+The logo is derived from Yolo, the Agent Substrate mascot designed by Nan
+Hockin, used under [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/).
+The window dots are Yolo's three robot puppets. The screenshots come from
+`--demo` and are regenerated with [VHS](https://github.com/charmbracelet/vhs)
+from `docs/tapes/`.

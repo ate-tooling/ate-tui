@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <title>ate-tui</title>
+  <!-- A terminal window with a Yolo-style octopus in it. Derived from the
+       Agent Substrate logo (Yolo, by Nan Hockin), CC-BY-4.0 / Apache-2.0. -->
+  <defs>
+    <g id="tentacles" fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M194 326 C136 346 92 386 100 428 C106 458 144 460 146 436"/>
+      <path d="M236 352 C234 398 230 436 212 458 C198 474 178 462 190 446"/>
+      <path d="M276 352 C278 398 282 436 300 458 C314 474 334 462 322 446"/>
+      <path d="M318 326 C376 346 420 386 412 428 C406 458 368 460 366 436"/>
+    </g>
+  </defs>
+
+  <!-- a white border around the whole mark, for dark backgrounds -->
+  <g stroke="#fff" stroke-linejoin="round">
+    <rect x="40" y="72" width="432" height="336" rx="40" fill="#fff" stroke-width="32"/>
+    <use href="#tentacles" stroke-width="56"/>
+    <circle cx="256" cy="262" r="104" fill="#fff" stroke-width="32"/>
+  </g>
+
+  <!-- window -->
+  <rect x="40" y="72" width="432" height="336" rx="40" fill="#1e1e2e" stroke="#111" stroke-width="16"/>
+  <path d="M48 140 H464" stroke="#111" stroke-width="12"/>
+  <!-- the colors of Yolo's three robot puppets -->
+  <circle cx="92" cy="106" r="12" fill="#67b7dc" stroke="#111" stroke-width="6"/>
+  <circle cx="132" cy="106" r="12" fill="#eef27a" stroke="#111" stroke-width="6"/>
+  <circle cx="172" cy="106" r="12" fill="#e87cb2" stroke="#111" stroke-width="6"/>
+
+  <!-- prompt -->
+  <path d="M78 176 L100 192 L78 208" fill="none" stroke="#a6e3a1" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M112 210 H140" stroke="#a6e3a1" stroke-width="10" stroke-linecap="round"/>
+
+  <!-- tentacles spill over the bottom edge: outline, then fill, then suckers -->
+  <use href="#tentacles" stroke="#111" stroke-width="40"/>
+  <use href="#tentacles" stroke="#64d86d" stroke-width="24"/>
+  <g fill="#94ef94">
+    <ellipse cx="108" cy="398" rx="7" ry="5" transform="rotate(-70 108 398)"/>
+    <ellipse cx="231" cy="412" rx="7" ry="5" transform="rotate(-80 231 412)"/>
+    <ellipse cx="281" cy="412" rx="7" ry="5" transform="rotate(80 281 412)"/>
+    <ellipse cx="404" cy="398" rx="7" ry="5" transform="rotate(70 404 398)"/>
+  </g>
+
+  <!-- head -->
+  <circle cx="256" cy="262" r="104" fill="#64d86d" stroke="#111" stroke-width="16"/>
+  <circle cx="300" cy="198" r="13" fill="#34aa48"/>
+  <circle cx="332" cy="226" r="18" fill="#34aa48"/>
+  <circle cx="344" cy="262" r="9" fill="#34aa48"/>
+  <ellipse cx="196" cy="206" rx="16" ry="11" fill="#94ef94" transform="rotate(-35 196 206)"/>
+  <ellipse cx="178" cy="238" rx="10" ry="14" fill="#94ef94" transform="rotate(20 178 238)"/>
+  <ellipse cx="208" cy="300" rx="24" ry="16" fill="#94ef94"/>
+  <ellipse cx="304" cy="300" rx="24" ry="16" fill="#94ef94"/>
+
+  <!-- face -->
+  <circle cx="214" cy="276" r="30" fill="#1b1b1b"/>
+  <circle cx="298" cy="276" r="30" fill="#1b1b1b"/>
+  <circle cx="224" cy="264" r="11" fill="#fafafa"/>
+  <circle cx="308" cy="264" r="11" fill="#fafafa"/>
+  <circle cx="204" cy="290" r="5" fill="#fafafa"/>
+  <circle cx="288" cy="290" r="5" fill="#fafafa"/>
+  <path d="M244 286 Q256 282 268 286 Q270 314 256 318 Q242 314 244 286 Z" fill="#111"/>
+  <path d="M249 306 Q256 297 264 300 Q262 314 256 314 Q250 313 249 306 Z" fill="#e87cb2"/>
+</svg>
