@@ -4,13 +4,17 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	ateapi "go.ate.dev/substrate/api/ateapi/v1"
+	infrav1 "go.ate.dev/substrate/api/infra/k8s/ate/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // action is one write. Every action asks for confirmation and runs off the
@@ -22,10 +26,18 @@ type action struct {
 	kind kind
 	// typed asks the user to type the object name (or "yes") to confirm.
 	typed bool
+	// prompt names the number the dialog asks for ("replicas"), if any.
+	prompt string
 	// pending is the state shown when the RPC returns no object.
 	pending  string
 	stateCol int
-	run      func(ctx context.Context, b Backend, obj any, sync bool) (any, error)
+	run      func(ctx context.Context, b Backend, obj any, in actionInput) (any, error)
+}
+
+// actionInput is what the confirm dialog adds to an action.
+type actionInput struct {
+	sync   bool  // suspend: synchronous durability
+	number int32 // the prompt's value
 }
 
 func actorRef(obj any) *ateapi.ObjectRef {
@@ -45,23 +57,23 @@ func asAny[T any](v *T, err error) (any, error) {
 
 var actions = []*action{
 	{name: "suspend", past: "suspended", key: "s", kind: kActors, pending: "Suspending", stateCol: 2,
-		run: func(ctx context.Context, b Backend, obj any, sync bool) (any, error) {
+		run: func(ctx context.Context, b Backend, obj any, in actionInput) (any, error) {
 			mode := ateapi.DurabilityMode_DURABILITY_MODE_ASYNCHRONOUS
-			if sync {
+			if in.sync {
 				mode = ateapi.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS
 			}
 			return asAny(b.SuspendActor(ctx, actorRef(obj), mode))
 		}},
 	{name: "resume", past: "resumed", key: "R", kind: kActors, pending: "Resuming", stateCol: 2,
-		run: func(ctx context.Context, b Backend, obj any, _ bool) (any, error) {
+		run: func(ctx context.Context, b Backend, obj any, _ actionInput) (any, error) {
 			return asAny(b.ResumeActor(ctx, actorRef(obj)))
 		}},
 	{name: "revert", past: "reverted", key: "v", kind: kActors, pending: "Reverting", stateCol: 2,
-		run: func(ctx context.Context, b Backend, obj any, _ bool) (any, error) {
+		run: func(ctx context.Context, b Backend, obj any, _ actionInput) (any, error) {
 			return asAny(b.RevertActor(ctx, actorRef(obj)))
 		}},
 	{name: "delete", past: "deleted", key: "ctrl+d", kind: kActors, typed: true, pending: "Deleting", stateCol: 2,
-		run: func(ctx context.Context, b Backend, obj any, _ bool) (any, error) {
+		run: func(ctx context.Context, b Backend, obj any, _ actionInput) (any, error) {
 			a, err := b.DeleteActor(ctx, actorRef(obj))
 			if a != nil {
 				// Show the delete in progress whatever the returned record says.
@@ -73,17 +85,56 @@ var actions = []*action{
 			return asAny(a, err)
 		}},
 	{name: "drain", past: "drained", key: "D", kind: kWorkers, pending: "Draining", stateCol: 1,
-		run: func(ctx context.Context, b Backend, obj any, _ bool) (any, error) {
+		run: func(ctx context.Context, b Backend, obj any, _ actionInput) (any, error) {
 			return asAny(b.DrainWorker(ctx, workerName(obj)))
 		}},
 	{name: "mark available", past: "marked available", key: "A", kind: kWorkers, pending: "Active", stateCol: 1,
-		run: func(ctx context.Context, b Backend, obj any, _ bool) (any, error) {
+		run: func(ctx context.Context, b Backend, obj any, _ actionInput) (any, error) {
 			return asAny(b.MarkWorkerAvailable(ctx, workerName(obj)))
 		}},
 	{name: "mark unavailable", past: "marked unavailable", key: "U", kind: kWorkers, pending: "Unavailable", stateCol: 1,
-		run: func(ctx context.Context, b Backend, obj any, _ bool) (any, error) {
+		run: func(ctx context.Context, b Backend, obj any, _ actionInput) (any, error) {
 			return asAny(b.MarkWorkerUnavailable(ctx, workerName(obj)))
 		}},
+	{name: "scale", past: "scaled", key: "z", kind: kWorkerPools, prompt: "replicas", pending: "Scaling", stateCol: 7,
+		run: func(ctx context.Context, b Backend, obj any, in actionInput) (any, error) {
+			p := obj.(*infrav1.WorkerPool)
+			return asAny(b.ScaleWorkerPool(ctx, p.Namespace, p.Name, in.number))
+		}},
+	kubeDelete(kWorkerPools, 7), kubeDelete(kSandboxCfgs, 6), kubeDelete(kCSIDrivers, 4),
+}
+
+// kubeDelete deletes a CRD. The row stays, Terminating, until the re-poll
+// finds it gone; a SandboxConfig a pool still uses stays until it is released.
+func kubeDelete(k kind, stateCol int) *action {
+	return &action{name: "delete", past: "deleted", key: "ctrl+d", kind: k, typed: true, pending: "Terminating", stateCol: stateCol,
+		run: func(ctx context.Context, b Backend, obj any, _ actionInput) (any, error) {
+			o := obj.(metav1.Object)
+			if err := b.DeleteObject(ctx, o); err != nil {
+				return nil, err
+			}
+			return terminating(obj), nil
+		}}
+}
+
+// terminating is a copy of obj marked as being deleted, for the row.
+func terminating(obj any) any {
+	now := metav1.Now()
+	switch o := obj.(type) {
+	case *infrav1.WorkerPool:
+		c := o.DeepCopy()
+		c.DeletionTimestamp = &now
+		return c
+	case *infrav1.SandboxConfig:
+		c := o.DeepCopy()
+		c.DeletionTimestamp = &now
+		return c
+	case *infrav1.CSIDriverConfig:
+		c := o.DeepCopy()
+		c.DeletionTimestamp = &now
+		return c
+	}
+	return nil
 }
 
 func lookupAction(k kind, key string) *action {
@@ -109,6 +160,10 @@ type confirm struct {
 	targets []target
 	sync    bool
 	refused bool // the typed text did not match on the last ⏎
+	// diff is what an edit changes, shown in the dialog.
+	diff []string
+	// retry reopens the editor if the server refuses a create or an edit.
+	retry *editMsg
 }
 
 // want is the text a typed confirm needs.
@@ -138,7 +193,8 @@ type (
 		failed int
 		first  error
 		single string
-		sync   bool
+		in     actionInput
+		retry  *editMsg
 	}
 )
 
@@ -190,6 +246,8 @@ func (m *Model) targets() []target {
 			GetMetadata() *ateapi.ResourceMetadata
 		}); ok {
 			name = md.GetMetadata().GetName()
+		} else if o, ok := r.obj.(metav1.Object); ok {
+			name = o.GetName()
 		}
 		return target{id: r.id, name: name, obj: r.obj}
 	}
@@ -225,6 +283,11 @@ func (m *Model) startAction(a *action) tea.Cmd {
 	}
 	m.confirm = &confirm{act: a, key: m.cur, targets: ts}
 	m.mode, m.input = modeConfirm, ""
+	if a.prompt != "" && len(ts) == 1 {
+		if p, ok := ts[0].obj.(*infrav1.WorkerPool); ok {
+			m.input = fmt.Sprint(p.Spec.Replicas)
+		}
+	}
 	return nil
 }
 
@@ -233,6 +296,22 @@ func (m *Model) keyConfirm(msg tea.KeyMsg) tea.Cmd {
 	cancel := func() tea.Cmd {
 		m.confirm, m.mode = nil, modeTable
 		m.setStatus(c.act.name+" cancelled", false)
+		return nil
+	}
+	if c.act.prompt != "" {
+		switch msg.Type {
+		case tea.KeyEsc:
+			return cancel()
+		case tea.KeyEnter:
+			n, err := strconv.ParseInt(strings.TrimSpace(m.input), 10, 32)
+			if err != nil || n < 0 {
+				c.refused = true
+				return nil
+			}
+			return m.runAction(actionInput{number: int32(n)})
+		}
+		c.refused = false
+		m.editInput(msg)
 		return nil
 	}
 	if c.act.typed {
@@ -244,7 +323,7 @@ func (m *Model) keyConfirm(msg tea.KeyMsg) tea.Cmd {
 				c.refused = true
 				return nil
 			}
-			return m.runAction()
+			return m.runAction(actionInput{})
 		}
 		c.refused = false
 		m.editInput(msg)
@@ -252,7 +331,7 @@ func (m *Model) keyConfirm(msg tea.KeyMsg) tea.Cmd {
 	}
 	switch msg.String() {
 	case "y", "Y", "enter":
-		return m.runAction()
+		return m.runAction(actionInput{sync: c.sync})
 	case "n", "N", "esc", "q":
 		return cancel()
 	case "tab", "m":
@@ -264,13 +343,13 @@ func (m *Model) keyConfirm(msg tea.KeyMsg) tea.Cmd {
 }
 
 // runAction starts the confirmed action on every target in parallel.
-func (m *Model) runAction() tea.Cmd {
+func (m *Model) runAction(in actionInput) tea.Cmd {
 	c := m.confirm
 	m.confirm, m.mode = nil, modeTable
 	clear(m.tableFor(c.key).marked)
 	m.gen++
 	batch := m.gen
-	m.batches[batch] = &actionBatch{act: c.act, key: c.key, total: len(c.targets), sync: c.sync}
+	m.batches[batch] = &actionBatch{act: c.act, key: c.key, total: len(c.targets), in: in, retry: c.retry}
 	if len(c.targets) == 1 {
 		m.batches[batch].single = c.targets[0].id
 	}
@@ -281,11 +360,11 @@ func (m *Model) runAction() tea.Cmd {
 	m.setStatus(c.act.name+" "+what+"…", false)
 
 	timeout := actionTimeout
-	if c.sync {
+	if in.sync {
 		timeout = syncSuspendTimeout
 	}
 	sem := make(chan struct{}, actionParallelism)
-	b, act, sync := m.backend, c.act, c.sync
+	b, act := m.backend, c.act
 	cmds := make([]tea.Cmd, 0, len(c.targets))
 	for _, t := range c.targets {
 		cmds = append(cmds, func() tea.Msg {
@@ -293,7 +372,7 @@ func (m *Model) runAction() tea.Cmd {
 			defer func() { <-sem }()
 			ctx, cancel := context.WithTimeout(context.Background(), timeout)
 			defer cancel()
-			obj, err := act.run(ctx, b, t.obj, sync)
+			obj, err := act.run(ctx, b, t.obj, in)
 			return actionResultMsg{batch: batch, id: t.id, obj: obj, target: t.obj, err: err}
 		})
 	}
@@ -327,6 +406,10 @@ func (m *Model) actionResult(msg actionResultMsg) tea.Cmd {
 	}
 	delete(m.batches, msg.batch)
 	m.setStatus(batchSummary(bt), bt.failed > 0)
+	if bt.retry != nil && msg.err != nil && refused(msg.err) && bt.key == m.cur {
+		m.setStatus(batchSummary(bt)+" (editing again)", true)
+		return tea.Batch(append(cmds, m.editAgain(bt.retry, msg.err))...)
+	}
 	if bt.failed < bt.total {
 		key := bt.key
 		cmds = append(cmds, tea.Tick(m.repoll, func(time.Time) tea.Msg { return repollMsg{key} }))
@@ -356,6 +439,12 @@ func actionErr(err error) string {
 	case codes.Unauthenticated:
 		s += " (the token was rejected; check --token-file or the ate-client ServiceAccount)"
 	}
+	switch {
+	case apierrors.IsForbidden(err):
+		s += " (your kubeconfig user lacks this RBAC permission)"
+	case apierrors.IsConflict(err):
+		s += " (it changed since it was read; edit it again)"
+	}
 	return s
 }
 
@@ -376,6 +465,9 @@ func (m *Model) optimistic(bt *actionBatch, id string, obj any) {
 		d.rows[i] = actorRow(o, now)
 	case *ateapi.Worker:
 		d.rows[i] = workerRow(o, now)
+	case metav1.Object:
+		r, _ := m.kubeRow(o, now)
+		d.rows[i] = r
 	default:
 		old := d.rows[i]
 		cells := slices.Clone(old.cells)

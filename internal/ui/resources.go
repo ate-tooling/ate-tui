@@ -26,6 +26,8 @@ type Backend interface {
 	ListWorkers(ctx context.Context) ([]*ateapi.Worker, error)
 	ListWorkerAssignments(ctx context.Context, worker string) ([]*ateapi.ActorAssignment, error)
 	ListWorkerPools(ctx context.Context) ([]infrav1.WorkerPool, error)
+	ListSandboxConfigs(ctx context.Context) ([]infrav1.SandboxConfig, error)
+	ListCSIDriverConfigs(ctx context.Context) ([]infrav1.CSIDriverConfig, error)
 	GetActor(ctx context.Context, ref *ateapi.ObjectRef) (*ateapi.Actor, error)
 	GetActorTemplate(ctx context.Context, ref *ateapi.ObjectRef) (*ateapi.ActorTemplate, error)
 	GetActorEgressPolicy(ctx context.Context, ref *ateapi.ObjectRef) (*ateapi.EgressPolicy, error)
@@ -33,6 +35,9 @@ type Backend interface {
 	GetAtespaceAccessPolicy(ctx context.Context, atespace string) (*ateapi.AccessPolicy, error)
 	PodLogs(ctx context.Context, namespace, pod string, opts *corev1.PodLogOptions) (io.ReadCloser, error)
 	PodEvents(ctx context.Context, namespace, pod string) ([]corev1.Event, error)
+	// ObjectEvents are the events about any object; an empty namespace
+	// looks in every namespace, for a cluster-scoped object.
+	ObjectEvents(ctx context.Context, namespace, kind, name string) ([]corev1.Event, error)
 
 	// PrepareProxy mints what DialActor needs and may take a while.
 	// DialActor tunnels to an actor port; the router resumes a suspended actor.
@@ -51,6 +56,12 @@ type Backend interface {
 	CreateActorTemplate(ctx context.Context, t *ateapi.ActorTemplate) (*ateapi.ActorTemplate, error)
 	CreateActor(ctx context.Context, a *ateapi.Actor) (*ateapi.Actor, error)
 	CreateTag(ctx context.Context, t *ateapi.Tag) (*ateapi.Tag, error)
+
+	// Kubernetes writes on a *WorkerPool, *SandboxConfig or *CSIDriverConfig.
+	CreateObject(ctx context.Context, obj metav1.Object) (metav1.Object, error)
+	UpdateObject(ctx context.Context, obj metav1.Object) (metav1.Object, error)
+	DeleteObject(ctx context.Context, obj metav1.Object) error
+	ScaleWorkerPool(ctx context.Context, namespace, name string, replicas int32) (*infrav1.WorkerPool, error)
 }
 
 type kind string
@@ -62,6 +73,8 @@ const (
 	kTags        kind = "tags"
 	kWorkers     kind = "workers"
 	kWorkerPools kind = "workerpools"
+	kSandboxCfgs kind = "sandboxconfigs"
+	kCSIDrivers  kind = "csidriverconfigs"
 	kAssignments kind = "assignments"
 	kHistory     kind = "history"
 )
@@ -203,10 +216,11 @@ var kinds = []*kindDef{
 	},
 	{
 		kind: kWorkerPools, aliases: []string{"workerpool", "wp", "pools", "pool"},
-		columns: []string{"NAMESPACE", "NAME", "DESIRED", "CURRENT", "READY", "SANDBOX", "AGE"},
-		wide:    []string{"IMAGE"},
-		drop:    []int{3, 2, 5},
-		hints:   []hint{{"enter", "workers"}, {"y", "yaml"}, {"X", "explain"}, {"u", "relations"}},
+		columns: []string{"NAMESPACE", "NAME", "DESIRED", "CURRENT", "READY", "SANDBOX", "CONFIG", "STATUS", "AGE"},
+		wide:    []string{"IMAGE", "UID"},
+		drop:    []int{3, 2, 6, 5},
+		hints: []hint{{"enter", "workers"}, {"y", "yaml"}, {"X", "explain"}, {"u", "relations"}, {"E", "events"},
+			{"n", "new"}, {"ctrl+n", "clone"}, {"ctrl+e", "edit"}, {"z", "scale"}, {"ctrl+d", "delete"}},
 		fetch: func(ctx context.Context, b Backend, _ string, now time.Time) ([]row, error) {
 			ps, err := b.ListWorkerPools(ctx)
 			if err != nil {
@@ -215,6 +229,34 @@ var kinds = []*kindDef{
 			rows := make([]row, 0, len(ps))
 			for i := range ps {
 				rows = append(rows, poolRow(&ps[i], now))
+			}
+			return rows, nil
+		},
+	},
+	{
+		kind: kSandboxCfgs, aliases: []string{"sandboxconfig", "sbc", "sandboxes", "sandbox"},
+		columns: []string{"NAME", "CLASS", "DEFAULT", "VERSIONS", "CLASS DEFAULT", "POOLS", "STATUS", "AGE"},
+		wide:    []string{"ARCHES", "UID"},
+		drop:    []int{4, 3, 5},
+		hints: []hint{{"enter", "pools"}, {"y", "yaml"}, {"X", "explain"}, {"u", "relations"}, {"E", "events"},
+			{"n", "new"}, {"ctrl+n", "clone"}, {"ctrl+e", "edit"}, {"ctrl+d", "delete"}},
+		fetch: fetchSandboxConfigs,
+	},
+	{
+		kind: kCSIDrivers, aliases: []string{"csidriverconfig", "csi", "csidrivers"},
+		columns: []string{"NAME", "DRIVER", "ENDPOINT", "TLS", "STATUS", "AGE"},
+		wide:    []string{"NODE SOCKET", "UID"},
+		drop:    []int{3, 2},
+		hints: []hint{{"enter", "yaml"}, {"y", "yaml"}, {"E", "events"},
+			{"n", "new"}, {"ctrl+n", "clone"}, {"ctrl+e", "edit"}, {"ctrl+d", "delete"}},
+		fetch: func(ctx context.Context, b Backend, _ string, now time.Time) ([]row, error) {
+			cs, err := b.ListCSIDriverConfigs(ctx)
+			if err != nil {
+				return nil, err
+			}
+			rows := make([]row, 0, len(cs))
+			for i := range cs {
+				rows = append(rows, csiRow(&cs[i], now))
 			}
 			return rows, nil
 		},
@@ -367,32 +409,38 @@ func templateRow(t *ateapi.ActorTemplate, now time.Time) row {
 }
 
 func poolRow(p *infrav1.WorkerPool, now time.Time) row {
-	lv := lvNormal
+	lv, st := lvNormal, "Ready"
 	if p.Status.ReadyReplicas < p.Spec.Replicas {
-		lv = lvWarn
+		lv, st = lvWarn, "Progressing"
 	}
 	var classes []string
 	for _, sc := range p.Status.SandboxClasses {
 		name := string(sc.Name)
 		for _, c := range sc.Conditions {
 			if c.Type == infrav1.WorkerPoolSandboxClassConditionResolved && c.Status != metav1.ConditionTrue {
-				lv = lvError
+				lv, st = lvError, dash(c.Reason)
 				name += "!"
 			}
 		}
 		classes = append(classes, name)
 	}
+	if p.DeletionTimestamp != nil {
+		lv, st = lvGone, "Terminating"
+	}
 	return newRow(p.Namespace+"/"+p.Name, p, lv, []string{
 		p.Namespace, p.Name,
 		fmt.Sprint(p.Spec.Replicas), fmt.Sprint(p.Status.Replicas), fmt.Sprint(p.Status.ReadyReplicas),
 		dash(strings.Join(classes, ",")),
+		dash(p.ResolvedSandboxConfig()),
+		st,
 		age(p.CreationTimestamp.Time, now),
 		dash(p.Spec.WorkerImage),
+		dash(string(p.UID)),
 	}, map[int]string{
 		2: fmt.Sprintf("%010d", p.Spec.Replicas),
 		3: fmt.Sprintf("%010d", p.Status.Replicas),
 		4: fmt.Sprintf("%010d", p.Status.ReadyReplicas),
-		6: sortTime(p.CreationTimestamp.Time),
+		8: sortTime(p.CreationTimestamp.Time),
 	})
 }
 

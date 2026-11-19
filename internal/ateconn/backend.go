@@ -10,6 +10,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 const pageSize = 500
@@ -114,6 +115,24 @@ func (c *Conn) ListWorkerPools(ctx context.Context) ([]infrav1.WorkerPool, error
 	return l.Items, nil
 }
 
+// ListSandboxConfigs lists the cluster-scoped SandboxConfigs.
+func (c *Conn) ListSandboxConfigs(ctx context.Context) ([]infrav1.SandboxConfig, error) {
+	l, err := c.Ate.AteV1().SandboxConfigs().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return l.Items, nil
+}
+
+// ListCSIDriverConfigs lists the cluster-scoped CSIDriverConfigs.
+func (c *Conn) ListCSIDriverConfigs(ctx context.Context) ([]infrav1.CSIDriverConfig, error) {
+	l, err := c.Ate.AteV1().CSIDriverConfigs().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	return l.Items, nil
+}
+
 // PodLogs streams the logs of a worker pod. A worker pod hosts one actor at a
 // time but keeps earlier actors' lines, so callers filter by actor labels.
 func (c *Conn) PodLogs(ctx context.Context, namespace, pod string, opts *corev1.PodLogOptions) (io.ReadCloser, error) {
@@ -122,10 +141,17 @@ func (c *Conn) PodLogs(ctx context.Context, namespace, pod string, opts *corev1.
 
 // PodEvents lists the core/v1 events about a pod, as kubectl describe does.
 func (c *Conn) PodEvents(ctx context.Context, namespace, pod string) ([]corev1.Event, error) {
+	return c.ObjectEvents(ctx, namespace, "Pod", pod)
+}
+
+// ObjectEvents lists the core/v1 events about an object. A cluster-scoped
+// object has an empty namespace, and its events are looked up in every
+// namespace, since recorders put them in "default".
+func (c *Conn) ObjectEvents(ctx context.Context, namespace, kind, name string) ([]corev1.Event, error) {
 	l, err := c.Kube.CoreV1().Events(namespace).List(ctx, metav1.ListOptions{
 		FieldSelector: fields.AndSelectors(
-			fields.OneTermEqualSelector("involvedObject.name", pod),
-			fields.OneTermEqualSelector("involvedObject.kind", "Pod"),
+			fields.OneTermEqualSelector("involvedObject.name", name),
+			fields.OneTermEqualSelector("involvedObject.kind", kind),
 		).String(),
 	})
 	if err != nil {
@@ -206,4 +232,75 @@ func (c *Conn) CreateActor(ctx context.Context, a *ateapi.Actor) (*ateapi.Actor,
 
 func (c *Conn) CreateTag(ctx context.Context, t *ateapi.Tag) (*ateapi.Tag, error) {
 	return c.Control.CreateTag(ctx, &ateapi.CreateTagRequest{Tag: t})
+}
+
+// Kubernetes writes. obj is a *WorkerPool, *SandboxConfig or
+// *CSIDriverConfig; the calls use the kubeconfig credentials, not ateapi's.
+
+func (c *Conn) CreateObject(ctx context.Context, obj metav1.Object) (metav1.Object, error) {
+	v1 := c.Ate.AteV1()
+	co := metav1.CreateOptions{FieldManager: fieldManager}
+	switch o := obj.(type) {
+	case *infrav1.WorkerPool:
+		return asObject(v1.WorkerPools(o.Namespace).Create(ctx, o, co))
+	case *infrav1.SandboxConfig:
+		return asObject(v1.SandboxConfigs().Create(ctx, o, co))
+	case *infrav1.CSIDriverConfig:
+		return asObject(v1.CSIDriverConfigs().Create(ctx, o, co))
+	}
+	return nil, fmt.Errorf("cannot create %T", obj)
+}
+
+// UpdateObject replaces obj. Its resourceVersion makes the API server
+// refuse the update with a Conflict when the object changed since it was read.
+func (c *Conn) UpdateObject(ctx context.Context, obj metav1.Object) (metav1.Object, error) {
+	v1 := c.Ate.AteV1()
+	uo := metav1.UpdateOptions{FieldManager: fieldManager}
+	switch o := obj.(type) {
+	case *infrav1.WorkerPool:
+		return asObject(v1.WorkerPools(o.Namespace).Update(ctx, o, uo))
+	case *infrav1.SandboxConfig:
+		return asObject(v1.SandboxConfigs().Update(ctx, o, uo))
+	case *infrav1.CSIDriverConfig:
+		return asObject(v1.CSIDriverConfigs().Update(ctx, o, uo))
+	}
+	return nil, fmt.Errorf("cannot update %T", obj)
+}
+
+// DeleteObject deletes obj, and only the object that was read: the UID
+// precondition fails if it was deleted and created again meanwhile.
+func (c *Conn) DeleteObject(ctx context.Context, obj metav1.Object) error {
+	v1 := c.Ate.AteV1()
+	uid := obj.GetUID()
+	do := metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}}
+	switch o := obj.(type) {
+	case *infrav1.WorkerPool:
+		return v1.WorkerPools(o.Namespace).Delete(ctx, o.Name, do)
+	case *infrav1.SandboxConfig:
+		return v1.SandboxConfigs().Delete(ctx, o.Name, do)
+	case *infrav1.CSIDriverConfig:
+		return v1.CSIDriverConfigs().Delete(ctx, o.Name, do)
+	}
+	return fmt.Errorf("cannot delete %T", obj)
+}
+
+// ScaleWorkerPool sets spec.replicas with a merge patch, as kubectl scale
+// does through the scale subresource.
+func (c *Conn) ScaleWorkerPool(ctx context.Context, namespace, name string, replicas int32) (*infrav1.WorkerPool, error) {
+	patch := fmt.Appendf(nil, `{"spec":{"replicas":%d}}`, replicas)
+	return c.Ate.AteV1().WorkerPools(namespace).Patch(ctx, name, types.MergePatchType, patch,
+		metav1.PatchOptions{FieldManager: fieldManager})
+}
+
+const fieldManager = "ate-tui"
+
+// asObject keeps a typed nil from becoming a non-nil interface.
+func asObject[T any, P interface {
+	*T
+	metav1.Object
+}](o P, err error) (metav1.Object, error) {
+	if o == nil {
+		return nil, err
+	}
+	return o, err
 }

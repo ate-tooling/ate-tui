@@ -7,6 +7,7 @@ import (
 	"time"
 
 	ateapi "go.ate.dev/substrate/api/ateapi/v1"
+	infrav1 "go.ate.dev/substrate/api/infra/k8s/ate/v1"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -203,6 +204,67 @@ func TestBytes(t *testing.T) {
 	for in, want := range map[int64]string{0: "-", 512: "512B", 1 << 30: "1Gi", 1536 << 20: "1.5Gi"} {
 		if got := Bytes(in); got != want {
 			t.Errorf("Bytes(%d) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestSandboxConfig(t *testing.T) {
+	disabled := infrav1.SandboxVersionStateDisabled
+	cfg := func(mut ...func(*infrav1.SandboxConfig)) *infrav1.SandboxConfig {
+		c := &infrav1.SandboxConfig{
+			ObjectMeta: metav1.ObjectMeta{Name: "gv", CreationTimestamp: metav1.NewTime(now.Add(-time.Hour)),
+				Finalizers: []string{infrav1.SandboxConfigWorkerPoolProtectionFinalizer}},
+			Spec: infrav1.SandboxConfigSpec{SandboxClass: infrav1.SandboxClassGvisor, DefaultVersion: "v1",
+				Versions: []infrav1.SandboxVersionConfig{{Name: "v1"}}},
+		}
+		for _, m := range mut {
+			m(c)
+		}
+		return c
+	}
+	pool := func(name string, spec, status string) *infrav1.WorkerPool {
+		p := &infrav1.WorkerPool{ObjectMeta: metav1.ObjectMeta{Namespace: "w", Name: name}}
+		sc := infrav1.WorkerPoolSandboxClass{Name: infrav1.SandboxClassGvisor}
+		if spec != "" {
+			sc.ConfigRef = &infrav1.SandboxConfigReference{Name: spec}
+		}
+		p.Spec.SandboxClasses = []infrav1.WorkerPoolSandboxClass{sc}
+		st := infrav1.WorkerPoolSandboxClassStatus{Name: infrav1.SandboxClassGvisor}
+		if status != "" {
+			st.ConfigRef = &infrav1.SandboxConfigReference{Name: status}
+		}
+		p.Status.SandboxClasses = []infrav1.WorkerPoolSandboxClassStatus{st}
+		return p
+	}
+	deleting := func(c *infrav1.SandboxConfig) {
+		t := metav1.NewTime(now.Add(-10 * time.Minute))
+		c.DeletionTimestamp = &t
+	}
+	tests := []struct {
+		name    string
+		c       *infrav1.SandboxConfig
+		pools   []*infrav1.WorkerPool
+		summary string
+		finding string
+		level   Level
+	}{
+		{"in use", cfg(), []*infrav1.WorkerPool{pool("a", "", "gv"), pool("b", "other", "other")}, "in use by 1 pool", "1 pool(s) use this config", Info},
+		{"unused", cfg(), nil, "not in use", "could not be listed", Info},
+		{"named, unresolved", cfg(), []*infrav1.WorkerPool{pool("a", "gv", "old")}, "not in use", "have not resolved it", Warn},
+		{"disabled default", cfg(func(c *infrav1.SandboxConfig) { c.Spec.Versions[0].State = &disabled }), []*infrav1.WorkerPool{},
+			"no usable default", "names no enabled version", Error},
+		{"deleting, held", cfg(deleting), []*infrav1.WorkerPool{pool("a", "", "gv")}, "pools still use it", "1 pool(s) hold it", Warn},
+		{"deleting, finalizer", cfg(deleting), []*infrav1.WorkerPool{}, "being deleted", "atecontroller", Warn},
+	}
+	for _, tt := range tests {
+		r := SandboxConfig(tt.c, tt.pools, now)
+		var titles []string
+		for _, f := range r.Findings {
+			titles = append(titles, f.Title)
+		}
+		all := strings.Join(titles, "\n")
+		if !strings.Contains(r.Summary, tt.summary) || !strings.Contains(all, tt.finding) || r.Level != tt.level {
+			t.Errorf("%s: summary %q level %v findings:\n%s", tt.name, r.Summary, r.Level, all)
 		}
 	}
 }

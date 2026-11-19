@@ -48,3 +48,6 @@ in config, and every write asks for confirmation.
 
 - Create atespaces, templates, actors and tags from YAML in `$EDITOR` (`n`,
   and `ctrl-n` to clone the selected one).
+- Manage the ate CRDs: SandboxConfig and CSIDriverConfig views next to
+  WorkerPools; create, clone, edit (diff in the dialog, Conflict on a
+  concurrent change), scale and delete, with the kubeconfig credentials.

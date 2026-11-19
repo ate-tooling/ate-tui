@@ -125,6 +125,14 @@ func toYAML(obj any) ([]string, error) {
 		c := o.DeepCopy()
 		c.ManagedFields = nil
 		out, err = yaml.Marshal(c)
+	case *infrav1.SandboxConfig:
+		c := o.DeepCopy()
+		c.ManagedFields = nil
+		out, err = yaml.Marshal(c)
+	case *infrav1.CSIDriverConfig:
+		c := o.DeepCopy()
+		c.ManagedFields = nil
+		out, err = yaml.Marshal(c)
 	default:
 		err = fmt.Errorf("no yaml for %T", obj)
 	}
@@ -230,6 +238,16 @@ func buildReport(ctx context.Context, b Backend, obj any) (explain.Report, error
 	case *infrav1.WorkerPool:
 		ws, _ := b.ListWorkers(ctx)
 		return explain.WorkerPool(o, ws, now), nil
+	case *infrav1.SandboxConfig:
+		ps, err := b.ListWorkerPools(ctx)
+		if err != nil {
+			return explain.SandboxConfig(o, nil, now), nil
+		}
+		pools := make([]*infrav1.WorkerPool, len(ps))
+		for i := range ps {
+			pools[i] = &ps[i]
+		}
+		return explain.SandboxConfig(o, pools, now), nil
 	}
 	return explain.Report{}, fmt.Errorf("explain is not available for %T", obj)
 }
@@ -315,7 +333,7 @@ func (m *Model) openHelp() {
 		hints []hint
 	}{
 		{"Navigation", []hint{
-			{":<kind> [atespace]", "switch view (actors, workers, templates, workerpools, atespaces, tags)"},
+			{":<kind> [atespace]", "switch view (actors, workers, templates, workerpools, sandboxconfigs, csidriverconfigs, atespaces, tags)"},
 			{":atespace <name>", "scope to an atespace; 0 or :all for every atespace"},
 			{"tab / shift-tab", "cycle common views"},
 			{"[ / ]", "back / forward through view history"},
@@ -349,9 +367,14 @@ func (m *Model) openHelp() {
 			{"X", "explain capacity, epochs, sandbox config, pod Warning events"},
 			{"p", "worker: jump to its pool"},
 		}},
+		{"ate CRDs (workerpools, sandboxconfigs, csidriverconfigs)", []hint{
+			{"⏎", "pool: its workers · sandboxconfig: the pools using it · csidriverconfig: yaml"},
+			{"X", "pool: rollout and sandbox class · sandboxconfig: versions, pools, deletion"},
+			{"E", "Kubernetes events about the object"},
+		}},
 		{"Diagnosis", []hint{
 			{"u", "relations of any row: template, tags, worker, pool, node, actors; ⏎ jumps"},
-			{"E", "Kubernetes events of the worker pod (actor or worker)"},
+			{"E", "Kubernetes events of the worker pod (actor or worker), or of an ate CRD"},
 			{":pulse", "cluster overview: actor states, slots, pools, crashes, stuck, golden errors"},
 			{":access", "global and atespace access policy bindings (no permission prediction)"},
 		}},
@@ -367,8 +390,11 @@ func (m *Model) openHelp() {
 			{"ctrl-d", "actor: delete; type the name (or yes for several) to confirm"},
 			{"D", "worker: drain (one-way)"},
 			{"A / U", "worker: mark available / unavailable"},
-			{"n", "atespace, template, actor or tag: create from a manifest in $EDITOR"},
+			{"n", "atespace, template, actor, tag or ate CRD: create from a manifest in $EDITOR"},
 			{"ctrl-n", "create a copy of the selected object (server fields removed)"},
+			{"ctrl-e", "ate CRD: edit in $EDITOR; the dialog shows the diff, a conflict is refused"},
+			{"z", "workerpool: scale to a number of replicas"},
+			{"ctrl-d", "ate CRD: delete; type the name to confirm (kubeconfig RBAC applies)"},
 			{":journal", "actions and results, this session and earlier"},
 		}},
 	}

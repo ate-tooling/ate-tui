@@ -12,7 +12,7 @@ import (
 )
 
 // tabKinds is the Tab / Shift-Tab cycle.
-var tabKinds = []kind{kActors, kWorkers, kTemplates, kWorkerPools, kAtespaces, kTags}
+var tabKinds = []kind{kActors, kWorkers, kTemplates, kWorkerPools, kSandboxCfgs, kAtespaces, kTags}
 
 func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	if msg.String() == "ctrl+c" {
@@ -107,6 +107,8 @@ func (m *Model) keyTable(key string) tea.Cmd {
 		return m.startCreate(false)
 	case "ctrl+n":
 		return m.startCreate(true)
+	case "ctrl+e":
+		return m.startEdit()
 	case "/":
 		m.mode, m.input = modeFilter, t.filter
 		return nil
@@ -253,8 +255,25 @@ func (m *Model) keyRow(key string, r *row) tea.Cmd {
 			return m.setAtespace(o.GetMetadata().GetName())
 		}
 	case *infrav1.WorkerPool:
-		if key == "enter" {
+		switch key {
+		case "enter":
 			return m.gotoKind(kWorkers, o.Name)
+		case "E":
+			return m.openObjectEvents(o.Namespace, "WorkerPool", o.Name)
+		}
+	case *infrav1.SandboxConfig:
+		switch key {
+		case "enter":
+			return m.gotoKind(kWorkerPools, o.Name)
+		case "E":
+			return m.openObjectEvents("", "SandboxConfig", o.Name)
+		}
+	case *infrav1.CSIDriverConfig:
+		switch key {
+		case "enter":
+			return m.openYAML(m.cur, r.id)
+		case "E":
+			return m.openObjectEvents("", "CSIDriverConfig", o.Name)
 		}
 	case *keptActor:
 		if key == "enter" {
@@ -494,7 +513,7 @@ func (m *Model) runCommand(in string) tea.Cmd {
 		if r := m.selected(); r != nil {
 			return m.keyRow("E", r)
 		}
-		m.setStatus("select an actor or worker to see its pod's events", true)
+		m.setStatus("select an actor, worker or ate CRD to see its events", true)
 		return nil
 	case "journal":
 		return m.openJournal()

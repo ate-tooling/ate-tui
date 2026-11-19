@@ -3,6 +3,7 @@ package ui
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -88,9 +89,12 @@ func (m *Model) journal(bt *actionBatch, id string, target any, err error) tea.C
 	}
 	if bt.act.name == "suspend" {
 		e.Mode = "async"
-		if bt.sync {
+		if bt.in.sync {
 			e.Mode = "sync"
 		}
+	}
+	if bt.act.prompt != "" {
+		e.Mode = fmt.Sprintf("%s=%d", bt.act.prompt, bt.in.number)
 	}
 	if err != nil {
 		e.Result, e.Error = "error", errString(err)

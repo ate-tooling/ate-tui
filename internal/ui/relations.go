@@ -66,6 +66,8 @@ func (m *Model) openRelations(r *row) tea.Cmd {
 		c.actors = cachedObjs[*ateapi.Actor](m, viewKey{kActors, as}, viewKey{kActors, ""})
 	case *infrav1.WorkerPool:
 		c.workers = cachedObjs[*ateapi.Worker](m, viewKey{kWorkers, ""})
+	case *infrav1.SandboxConfig:
+		c.pools = cachedObjs[*infrav1.WorkerPool](m, viewKey{kWorkerPools, ""})
 	case *ateapi.Worker:
 		c.pools = cachedObjs[*infrav1.WorkerPool](m, viewKey{kWorkerPools, ""})
 	}
@@ -143,6 +145,17 @@ func buildRelations(ctx context.Context, b Backend, obj any, c relCache) ([]rela
 			c.workers = ws
 		}
 		return poolRelations(o, c.workers), nil
+	case *infrav1.SandboxConfig:
+		if c.pools == nil {
+			ps, err := b.ListWorkerPools(ctx)
+			if err != nil {
+				return nil, err
+			}
+			for i := range ps {
+				c.pools = append(c.pools, &ps[i])
+			}
+		}
+		return sandboxConfigRelations(o, c.pools), nil
 	case *ateapi.Atespace:
 		n := o.GetMetadata().GetName()
 		return []relation{
@@ -296,12 +309,49 @@ func templateRelations(t *ateapi.ActorTemplate, actors []*ateapi.Actor) []relati
 	return out
 }
 
-// poolRelations: the workers that registered from the pool.
+func sandboxConfigRel(rel, name, info string) relation {
+	return relation{rel: rel, kind: kSandboxCfgs, filter: name, id: name, name: name, info: info}
+}
+
+// poolRelations: the SandboxConfig it resolved or is switching to, and the
+// workers that registered from the pool.
 func poolRelations(p *infrav1.WorkerPool, workers []*ateapi.Worker) []relation {
 	var out []relation
+	for _, sc := range p.Status.SandboxClasses {
+		if sc.ConfigRef != nil {
+			out = append(out, sandboxConfigRel("sandbox config", sc.ConfigRef.Name, string(sc.Name)))
+		}
+		if sc.PendingConfigRef != nil {
+			out = append(out, sandboxConfigRel("switching to", sc.PendingConfigRef.Name, string(sc.Name)))
+		}
+	}
 	for _, w := range workers {
 		if w.GetWorkerPool() == p.Name && w.GetWorkerNamespace() == p.Namespace {
 			out = append(out, workerRel(w.GetMetadata().GetName(), workers))
+		}
+	}
+	return out
+}
+
+// sandboxConfigRelations: the pools that use the config or switch to it.
+func sandboxConfigRelations(c *infrav1.SandboxConfig, pools []*infrav1.WorkerPool) []relation {
+	var out []relation
+	for _, p := range pools {
+		for _, sc := range p.Status.SandboxClasses {
+			rel := ""
+			switch {
+			case sc.ConfigRef != nil && sc.ConfigRef.Name == c.Name:
+				rel = "used by"
+			case sc.PendingConfigRef != nil && sc.PendingConfigRef.Name == c.Name:
+				rel = "switching pool"
+			default:
+				continue
+			}
+			r := poolRel(p.Namespace, p.Name)
+			r.rel = rel
+			row := poolRow(p, time.Time{})
+			r.info, r.level = fmt.Sprintf("%d/%d ready", p.Status.ReadyReplicas, p.Spec.Replicas), row.level
+			out = append(out, r)
 		}
 	}
 	return out

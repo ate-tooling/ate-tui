@@ -369,9 +369,12 @@ func (m *Model) viewFooter() []string {
 	case modeForward:
 		hints = []hint{{"⏎", "start"}, {"^u", "clear"}, {"esc", "cancel"}}
 	case modeConfirm:
-		if m.confirm != nil && m.confirm.act.typed {
+		switch {
+		case m.confirm != nil && m.confirm.act.prompt != "":
+			hints = []hint{{"⏎", "confirm"}, {"^u", "clear"}, {"esc", "cancel"}}
+		case m.confirm != nil && m.confirm.act.typed:
 			hints = []hint{{"⏎", "confirm"}, {"esc", "cancel"}}
-		} else {
+		default:
 			hints = []hint{{"y/⏎", "confirm"}, {"n/esc", "cancel"}}
 		}
 	default:

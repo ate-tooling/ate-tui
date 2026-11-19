@@ -9,8 +9,9 @@
 
 A terminal UI for [Agent Substrate](https://ate.dev), in the style of
 [sofka](https://sofka.rs). It browses atespaces, actors, actor templates,
-tags, workers and WorkerPools live, and explains why an actor or worker is
-unhealthy.
+tags, workers and the ate CRDs (WorkerPools, SandboxConfigs and
+CSIDriverConfigs) live, explains why an actor or worker is unhealthy, and,
+when writes are on, creates, edits, scales and deletes the CRDs.
 
 ![A tour of ate-tui --demo: the actors table, explaining a crashed actor, the pulse overview, a worker's relations and following an actor's logs](docs/images/demo.gif)
 
@@ -37,8 +38,8 @@ ate-tui connects the way `kubectl ate` does:
 - It authenticates with a minted `ate-client` ServiceAccount token, or with `--token-file`.
 
 `ATE_NAMESPACE`, `ATE_API_SERVICE_NAME` and `ATE_CLIENT_SERVICE_ACCOUNT`
-override the defaults, as they do for `kubectl ate`. WorkerPools and worker pod
-logs come from the Kubernetes API.
+override the defaults, as they do for `kubectl ate`. The ate CRDs, events and
+worker pod logs come from the Kubernetes API, with the kubeconfig credentials.
 
 `:ctx` lists the kubeconfig contexts, and `:ctx <name>` switches to one and
 reconnects. A switch drops the cached views, the timeline and the open
@@ -85,9 +86,9 @@ colors:
 
 **Keys.** These actions can be rebound: `quit down up top bottom page-down
 page-up filter command help back forward next-view prev-view all-atespaces
-sort invert faults mark refresh wide copy create clone explain yaml relations logs proxy
+sort invert faults mark refresh wide copy create clone edit explain yaml relations logs proxy
 egress events timeline worker template pool suspend resume revert delete
-drain available unavailable`. A key is one character, `ctrl+x`, `alt+x`,
+drain available unavailable scale`. A key is one character, `ctrl+x`, `alt+x`,
 `tab`, `f1`–`f12`, or `space`. A rebound action's old key does nothing. Two
 actions on one key is an error. `enter`, `esc`, `ctrl+c` and the arrow and
 page keys keep their meaning. The header, the footer and `?` show the keys as
@@ -124,20 +125,20 @@ The header then shows `[write]`. `--demo` allows writes only with `--write`.
 
 | Key | Action |
 | --- | --- |
-| `:` | command palette: `:actors [atespace]`, `:workers`, `:templates`, `:workerpools`, `:atespaces`, `:tags`, `:pulse`, `:access`, `:timeline`, `:journal`, `:pf`, `:ctx [name]`, `:q` |
+| `:` | command palette: `:actors [atespace]`, `:workers`, `:templates`, `:workerpools`, `:sandboxconfigs`, `:csidriverconfigs`, `:atespaces`, `:tags`, `:pulse`, `:access`, `:timeline`, `:journal`, `:pf`, `:ctx [name]`, `:q` |
 | `/` | filter (space = AND, `!term` = NOT); `esc` clears |
 | `ctrl-z` | faults only: crashed, stuck, draining, full, not ready |
 | `tab` / `shift-tab` | cycle views |
 | `[` / `]` | view history |
 | `0` | all atespaces |
 | `S` / `I` | cycle sort column / invert |
-| `⏎` | actor: explain · worker: assignments · template: its actors · atespace: its actors · pool: its workers |
-| `X` | explain (actors, workers, templates, pools) |
+| `⏎` | actor: explain · worker: assignments · template: its actors · atespace: its actors · pool: its workers · sandboxconfig: the pools using it · csidriverconfig: yaml |
+| `X` | explain (actors, workers, templates, pools, sandboxconfigs) |
 | `y` | yaml |
 | `l` | actor: follow its logs across worker moves · worker: the actors its pod kept logs for, deleted ones too (see [Logs](#logs)) |
 | `u` | relations of any row; `⏎` jumps to one (see [Diagnosis](#diagnosis)) |
 | `e` | actor: egress policy |
-| `E` | actor or worker: Kubernetes events of the worker pod |
+| `E` | actor or worker: Kubernetes events of the worker pod · ate CRD: its own events |
 | `T` | actor timeline of state changes seen this session |
 | `w` | wide: extra columns (actors: pod, sandbox, crash, uid; workers: namespace, epochs, labels, uid; …) and none hidden on a narrow terminal |
 | `c` | copy the row's name, or a pager's text (`C` in logs), with OSC 52; works over SSH and in tmux |
@@ -148,9 +149,11 @@ The header then shows `[write]`. `--demo` allows writes only with `--write`.
 | `s` | actor: suspend (`tab` in the dialog toggles async / sync durability; async is the default) |
 | `R` | actor: resume |
 | `v` | actor: revert to its durable snapshot (clears a crash) |
-| `ctrl-d` | actor: delete (type the name to confirm) |
-| `n` | atespaces, templates, actors, tags: create from a manifest in `$EDITOR` (see [Create](#create)) |
-| `ctrl-n` | create a copy of the selected atespace, template, actor or tag |
+| `ctrl-d` | actor or ate CRD: delete (type the name to confirm) |
+| `n` | atespaces, templates, actors, tags and the ate CRDs: create from a manifest in `$EDITOR` (see [Create](#create)) |
+| `ctrl-n` | create a copy of the selected atespace, template, actor, tag or ate CRD |
+| `ctrl-e` | ate CRD: edit in `$EDITOR` (see [Kubernetes resources](#kubernetes-resources)) |
+| `z` | workerpool: scale |
 | `D` | worker: drain (one-way) |
 | `A` / `U` | worker: mark available / unavailable |
 | `?` | help |
@@ -275,8 +278,52 @@ atespace, container image, template or source actor reopens the editor with
 the error at the top. Quitting with the file unchanged, or emptied, cancels.
 A good manifest goes through the usual confirm dialog. Creating needs
 `--write` or a `writeContexts` entry, and it is journaled. The cursor then
-lands on the new row. Templates are immutable, so to change one, delete it
-and create it again.
+lands on the new row. When the server refuses the manifest (invalid, already
+exists, failed precondition), the editor reopens with its error on top.
+Templates are immutable, so to change one, delete it and create it again.
+
+## Kubernetes resources
+
+`:workerpools`, `:sandboxconfigs` and `:csidriverconfigs` list the ate CRDs.
+They are read and written with the Kubernetes API and your kubeconfig
+credentials, so your RBAC applies, not ateapi's access policy. A Forbidden
+error says so.
+
+- **WorkerPools** show desired, current and ready replicas, the sandbox
+  class, the SandboxConfig the controller resolved (`CONFIG`), and a status:
+  `Ready`, `Progressing`, the unresolved reason, or `Terminating`.
+- **SandboxConfigs** show the class, the default version, enabled/total
+  versions, whether it is its class's default, how many pools' status names
+  it, and a status: `In use`, `Unused`, `No default`, `Terminating`, or
+  `Terminating (in use)`. A config a pool still uses keeps its finalizer
+  until the pool moves to another one. `X` says which pools hold it, and `u`
+  lists them.
+- **CSIDriverConfigs** show the driver, the controller endpoint, TLS and the
+  node socket (wide).
+
+Writes need `--write` or a `writeContexts` entry, ask for confirmation, and
+are journaled:
+
+- `n` starts from a commented manifest, filled from the selected row. A
+  manifest is the CRD's YAML, as `kubectl get -o yaml` prints it, parsed
+  strictly. Server-set fields in it are dropped, so kubectl output works as
+  a start. `ctrl-n` copies the selected object, without the class-default
+  annotation and finalizers.
+- `ctrl-e` opens the object as kubectl shows it, without `managedFields` and
+  `status`. The confirm dialog shows the diff. The update carries the
+  `resourceVersion` it was read at, so a change made meanwhile is refused
+  with a Conflict rather than overwritten. A rename is refused. Saving with
+  no change cancels. A schema or CEL rule the API server rejects reopens
+  the editor with the error.
+- `z` asks for a replica count, starting from the current one, and patches
+  `spec.replicas`. Marked pools all get the same count.
+- `ctrl-d` asks for the name, and deletes with a UID precondition, so an
+  object deleted and created again meanwhile is not touched.
+
+In `--demo`, the CRDs behave as the API server and atecontroller would: a
+scaled pool rolls one replica per poll, a bad sha256 is refused, and
+deleting `gvisor-stable` leaves it Terminating until `pool-gvisor` points at
+another config.
 
 ## Explain
 
@@ -293,6 +340,8 @@ and create it again.
   recent Warning events on the worker pod.
 - **Templates:** golden snapshot status and the actor states built from the template.
 - **WorkerPools:** ready replicas, sandbox class resolution, and how many workers registered.
+- **SandboxConfigs:** the default version and its architectures, the pools
+  that use it, switch to it or fail to resolve it, and what holds up its deletion.
 
 ## Release
 
@@ -317,14 +366,15 @@ and a frame ~0.2ms (`go test ./internal/ui -bench .`).
 ```
 cmd/ate-tui        flags, wiring
 internal/ateconn   port-forward, trust bundle, token, paged List calls, writes,
-                   atenet-router CONNECT dialer and podidentity certificate
+                   ate CRD reads and writes, atenet-router CONNECT dialer and
+                   podidentity certificate
 internal/proxy     local listeners and tunnel copying for f / :pf (tested)
 internal/config    config.yaml, XDG paths
 internal/skin      built-in Catppuccin palettes and custom skin files
 internal/explain   pure diagnosis functions (tested)
 internal/ui        model, views, keys, pager (yaml/explain/timeline/journal),
                    logs follow, relations, pulse, policies and events,
-                   actions and the confirm dialog
+                   actions and the confirm dialog, CRD edit and diff
 internal/demo      in-memory backend for --demo
 ```
 

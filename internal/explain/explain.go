@@ -454,6 +454,109 @@ func WorkerPool(p *infrav1.WorkerPool, workers []*ateapi.Worker, now time.Time) 
 	return r
 }
 
+// SandboxConfig explains a SandboxConfig's versions, the pools that use it
+// and what holds up its deletion. pools nil means they are not known.
+func SandboxConfig(c *infrav1.SandboxConfig, pools []*infrav1.WorkerPool, now time.Time) Report {
+	r := Report{Subject: "sandboxconfig " + c.Name}
+	r.fact("Class", string(c.Spec.SandboxClass))
+	r.fact("Default version", c.Spec.DefaultVersion)
+	var vs []string
+	for _, v := range c.Spec.Versions {
+		if v.State != nil && *v.State == infrav1.SandboxVersionStateDisabled {
+			vs = append(vs, v.Name+" (disabled)")
+		} else {
+			vs = append(vs, v.Name)
+		}
+	}
+	r.fact("Versions", strings.Join(vs, ", "))
+	classDefault := c.Annotations[infrav1.SandboxConfigClassDefaultAnnotation] == "true"
+	if classDefault {
+		r.fact("Class default", "yes: pools of class "+string(c.Spec.SandboxClass)+" without a configRef may use it (the newest default wins)")
+	}
+	r.fact("Age", Age(c.CreationTimestamp.Time, now))
+	r.Next = []string{"kubectl get sandboxconfig " + c.Name + " -o yaml"}
+
+	if def, ok := c.Spec.DefaultVersionConfig(); ok {
+		var arches []string
+		for a := range def.Assets {
+			arches = append(arches, a)
+		}
+		sort.Strings(arches)
+		r.add(OK, "Default version "+def.Name+" is enabled", "architectures: "+orDash(strings.Join(arches, ", ")))
+	} else {
+		r.add(Error, "defaultVersion "+orDash(c.Spec.DefaultVersion)+" names no enabled version",
+			"new sandboxes of pools using this config have nothing to boot")
+	}
+
+	var using, switching, waiting []string
+	for _, p := range pools {
+		id := p.Namespace + "/" + p.Name
+		named := false
+		for _, sc := range p.Spec.SandboxClasses {
+			if sc.ConfigRef != nil && sc.ConfigRef.Name == c.Name {
+				named = true
+			}
+		}
+		inStatus := false
+		for _, sc := range p.Status.SandboxClasses {
+			if sc.ConfigRef != nil && sc.ConfigRef.Name == c.Name {
+				using, inStatus = append(using, id), true
+			}
+			if sc.PendingConfigRef != nil && sc.PendingConfigRef.Name == c.Name {
+				switching, inStatus = append(switching, id), true
+			}
+		}
+		if named && !inStatus {
+			waiting = append(waiting, id)
+		}
+	}
+	switch {
+	case pools == nil:
+		r.add(Info, "WorkerPools could not be listed; which pools use this config is unknown")
+	case len(using) > 0:
+		r.add(Info, fmt.Sprintf("%d pool(s) use this config", len(using)), using...)
+	default:
+		r.add(Info, "No pool uses this config")
+	}
+	if len(switching) > 0 {
+		r.add(Info, fmt.Sprintf("%d pool(s) are switching to this config", len(switching)), switching...)
+	}
+	if len(waiting) > 0 {
+		r.add(Warn, fmt.Sprintf("%d pool(s) name this config but have not resolved it", len(waiting)),
+			append(waiting, "press X on the pool for the reason")...)
+	}
+
+	held := len(using) + len(switching)
+	switch {
+	case c.DeletionTimestamp != nil && held > 0:
+		r.Summary = "SandboxConfig is being deleted, but pools still use it."
+		r.add(Warn, fmt.Sprintf("Deleting since %s ago; %d pool(s) hold it", Age(c.DeletionTimestamp.Time, now), held),
+			"point those pools at another SandboxConfig (spec.sandboxClasses[].configRef); the controller then releases it")
+	case c.DeletionTimestamp != nil && hasFinalizer(c.Finalizers, infrav1.SandboxConfigWorkerPoolProtectionFinalizer):
+		r.Summary = "SandboxConfig is being deleted."
+		r.add(Warn, fmt.Sprintf("Deleting since %s ago; waiting for atecontroller to remove its finalizer", Age(c.DeletionTimestamp.Time, now)),
+			"if this lasts, check that atecontroller is running in ate-system")
+	case c.DeletionTimestamp != nil:
+		r.Summary = "SandboxConfig is being deleted."
+	case r.Level == Error:
+		r.Summary = "SandboxConfig has no usable default version."
+	case len(using) > 0:
+		r.Summary = fmt.Sprintf("SandboxConfig is in use by %d pool(s).", len(using))
+	default:
+		r.Summary = "SandboxConfig is not in use."
+	}
+	return r
+}
+
+func hasFinalizer(fs []string, f string) bool {
+	for _, x := range fs {
+		if x == f {
+			return true
+		}
+	}
+	return false
+}
+
 // RecentEvents is how far back Warning events on a worker pod count.
 const RecentEvents = time.Hour
 

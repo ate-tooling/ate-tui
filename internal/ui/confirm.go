@@ -69,6 +69,13 @@ func (m *Model) viewConfirm(maxH int) []string {
 		}
 	}
 	keys := "y/⏎ confirm  ·  n/esc cancel"
+	if a.prompt != "" {
+		tail = append(tail, "", stCount.Render(a.prompt+": ")+stInputPrompt.Render("> ")+stInput.Render(m.input)+stInput.Render("█"))
+		if c.refused {
+			tail = append(tail, stStatusErr.Render("not a number of "+a.prompt+"; nothing was changed"))
+		}
+		keys = "⏎ confirm  ·  esc cancel"
+	}
 	if a.typed {
 		tail = append(tail, "", stCount.Render("Type ")+stStatusErr.Render(c.want())+stCount.Render(" to confirm:"),
 			stInputPrompt.Render("> ")+stInput.Render(m.input)+stInput.Render("█"))
@@ -82,6 +89,20 @@ func (m *Model) viewConfirm(maxH int) []string {
 	// List as many objects as fit between the heading and the controls.
 	room := max(maxH-2-2-len(tail), 1)
 	var objs []string
+	for i, l := range c.diff {
+		if i == room-1 && len(c.diff) > room {
+			objs = append(objs, stDim.Render(fmt.Sprintf("  … and %d more lines", len(c.diff)-i)))
+			break
+		}
+		switch {
+		case strings.HasPrefix(l, "+"):
+			objs = append(objs, fg(cGreen).Render(l))
+		case strings.HasPrefix(l, "-"):
+			objs = append(objs, fg(cRed).Render(l))
+		default:
+			objs = append(objs, stDim.Render(l))
+		}
+	}
 	if len(c.targets) > 1 {
 		for i, t := range c.targets {
 			if i == room-1 && len(c.targets) > room {

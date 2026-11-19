@@ -14,6 +14,7 @@ import (
 	infrav1 "go.ate.dev/substrate/api/infra/k8s/ate/v1"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -26,6 +27,14 @@ type Backend struct {
 	actors    []*ateapi.Actor
 	workers   []*ateapi.Worker
 	pools     []infrav1.WorkerPool
+	// sandboxes, csiDrivers and kubeEvents are the other ate CRDs and
+	// their events; rv is the last resourceVersion handed out, and rolling
+	// the pools a write set rolling toward their spec.
+	sandboxes  []infrav1.SandboxConfig
+	csiDrivers []infrav1.CSIDriverConfig
+	kubeEvents []corev1.Event
+	rv         int
+	rolling    map[string]bool
 	// tags are the ones created through CreateTag; golden tags come from
 	// the templates.
 	tags []*ateapi.Tag
@@ -47,7 +56,7 @@ func ts(t time.Time) *timestamppb.Timestamp { return timestamppb.New(t) }
 func New() *Backend {
 	now := time.Now()
 	b := &Backend{start: now, rng: rand.New(rand.NewSource(7)),
-		pinned: map[*ateapi.Actor]bool{}, pending: map[*ateapi.Actor]int{}, podLogs: map[string]*podLog{}}
+		pinned: map[*ateapi.Actor]bool{}, pending: map[*ateapi.Actor]int{}, podLogs: map[string]*podLog{}, rolling: map[string]bool{}}
 	md := func(as, name string, age time.Duration) *ateapi.ResourceMetadata {
 		return &ateapi.ResourceMetadata{Atespace: as, Name: name, Uid: fmt.Sprintf("%08x-%04x", b.rng.Uint32(), b.rng.Intn(65535)),
 			CreateTime: ts(now.Add(-age)), UpdateTime: ts(now.Add(-age / 3))}
@@ -112,6 +121,7 @@ func New() *Backend {
 				}}},
 		})
 	}
+	b.seedKube(now)
 	for i := 0; i < 26; i++ {
 		t := b.templates[i%len(b.templates)]
 		a := &ateapi.Actor{
@@ -392,6 +402,7 @@ func (b *Backend) ListWorkerPools(context.Context) ([]infrav1.WorkerPool, error)
 	latency()
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.rollPools()
 	out := make([]infrav1.WorkerPool, len(b.pools))
 	for i := range b.pools {
 		out[i] = *b.pools[i].DeepCopy()

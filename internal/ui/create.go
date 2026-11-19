@@ -9,19 +9,25 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	ateapi "go.ate.dev/substrate/api/ateapi/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/yaml"
 )
 
 // Creating opens $EDITOR on a manifest, the same protojson-shaped YAML
-// `kubectl ate create actor-template -f` reads and `y` shows. A bad manifest
-// reopens the editor with the error on top; an unchanged or empty one
-// cancels. The parsed object then goes through the usual confirm dialog.
+// `kubectl ate create actor-template -f` reads and `y` shows, or for an ate
+// CRD the YAML kubectl reads. A bad manifest reopens the editor with the
+// error on top; an unchanged or empty one cancels. The parsed object then
+// goes through the usual confirm dialog. Editing a CRD works the same way
+// (see kubeedit.go).
 
 // createAction is the write a confirmed manifest runs.
 var createAction = &action{name: "create", past: "created", pending: "Creating",
-	run: func(ctx context.Context, b Backend, obj any, _ bool) (any, error) {
+	run: func(ctx context.Context, b Backend, obj any, _ actionInput) (any, error) {
 		switch o := obj.(type) {
 		case *ateapi.Atespace:
 			return asAny(b.CreateAtespace(ctx, o))
@@ -31,20 +37,25 @@ var createAction = &action{name: "create", past: "created", pending: "Creating",
 			return asAny(b.CreateActor(ctx, o))
 		case *ateapi.Tag:
 			return asAny(b.CreateTag(ctx, o))
+		case metav1.Object:
+			return b.CreateObject(ctx, o)
 		}
 		return nil, fmt.Errorf("cannot create %T", obj)
 	}}
 
 func creatable(k kind) bool {
-	return k == kAtespaces || k == kTemplates || k == kActors || k == kTags
+	return k == kAtespaces || k == kTemplates || k == kActors || k == kTags || kubeKind(k)
 }
 
 type (
 	// editMsg asks to open the editor on path.
 	editMsg struct {
 		key      viewKey
+		act      *action // createAction or editAction
 		path     string
 		original string // the manifest as offered, to spot "no changes"
+		// orig is the object an edit started from.
+		orig any
 	}
 	editedMsg struct {
 		editMsg
@@ -53,8 +64,10 @@ type (
 	// manifestMsg is a parsed manifest, or the reason it was not.
 	manifestMsg struct {
 		editMsg
-		obj       proto.Message
+		obj       any
 		id        string
+		text      string   // the manifest as saved, to edit again if the server refuses it
+		diff      []string // what an edit changes
 		cancelled bool
 		err       error
 	}
@@ -72,7 +85,7 @@ func (m *Model) startCreate(clone bool) tea.Cmd {
 	k := m.cur.kind
 	switch {
 	case !creatable(k):
-		m.setStatus("cannot create "+string(k)+" here; creating works on atespaces, templates, actors and tags", true)
+		m.setStatus("cannot create "+string(k)+" here; creating works on atespaces, templates, actors, tags, workerpools, sandboxconfigs and csidriverconfigs", true)
 		return nil
 	case m.backend == nil:
 		m.setStatus("not connected", true)
@@ -96,18 +109,26 @@ func (m *Model) startCreate(clone bool) tea.Cmd {
 	} else {
 		body = m.starterManifest(k)
 	}
-	content := editorHeader + body
-	key := m.cur
+	return writeManifest(editMsg{key: m.cur, act: createAction}, editorHeader+body)
+}
+
+// writeManifest puts content in a temp file and asks to edit it. Saving
+// msg.original, or content when that is empty, unchanged cancels.
+func writeManifest(msg editMsg, content string) tea.Cmd {
+	if msg.original == "" {
+		msg.original = content
+	}
 	return func() tea.Msg {
 		f, err := os.CreateTemp("", "ate-tui-*.yaml")
 		if err != nil {
-			return manifestMsg{err: err}
+			return manifestMsg{editMsg: editMsg{act: msg.act}, err: err}
 		}
 		defer f.Close()
 		if _, err := f.WriteString(content); err != nil {
-			return manifestMsg{err: err}
+			return manifestMsg{editMsg: editMsg{act: msg.act}, err: err}
 		}
-		return editMsg{key: key, path: f.Name(), original: content}
+		msg.path = f.Name()
+		return msg
 	}
 }
 
@@ -153,7 +174,19 @@ func (m *Model) edited(msg editedMsg) tea.Cmd {
 			out.cancelled = true
 			return out
 		}
-		out.obj, out.id, out.err = parseManifest(k, []byte(text))
+		out.text = text
+		switch {
+		case msg.act == editAction:
+			out.obj, out.id, out.diff, out.err = parseEdit(msg.orig, []byte(text))
+			if out.err == nil && len(out.diff) == 0 {
+				out.cancelled = true
+				return out
+			}
+		case kubeKind(k):
+			out.obj, out.id, out.err = parseKube(k, []byte(text))
+		default:
+			out.obj, out.id, out.err = parseManifest(k, []byte(text))
+		}
 		if out.err != nil {
 			// Put the error on top and edit again.
 			again := errorPrefix + strings.ReplaceAll(out.err.Error(), "\n", "\n"+errorPrefix) + "\n" + text
@@ -166,13 +199,18 @@ func (m *Model) edited(msg editedMsg) tea.Cmd {
 }
 
 func (m *Model) manifestParsed(msg manifestMsg) tea.Cmd {
+	name := msg.act.name
 	switch {
 	case msg.cancelled:
 		os.Remove(msg.path)
-		m.setStatus("create cancelled", false)
+		if name == "edit" {
+			m.setStatus("no changes; edit cancelled", false)
+		} else {
+			m.setStatus(name+" cancelled", false)
+		}
 		return nil
 	case msg.err != nil && msg.path == "":
-		m.setStatus("create: "+msg.err.Error(), true)
+		m.setStatus(name+": "+msg.err.Error(), true)
 		return nil
 	case msg.err != nil:
 		m.setStatus("manifest: "+msg.err.Error()+" (editing again)", true)
@@ -180,18 +218,38 @@ func (m *Model) manifestParsed(msg manifestMsg) tea.Cmd {
 	}
 	os.Remove(msg.path)
 	if msg.key != m.cur || m.backend == nil {
-		m.setStatus("the view changed while editing; create cancelled", true)
+		m.setStatus("the view changed while editing; "+name+" cancelled", true)
 		return nil
 	}
-	m.confirm = &confirm{act: createAction, key: msg.key, targets: []target{{id: msg.id, name: msg.id, obj: msg.obj}}}
+	retry := msg.editMsg
+	retry.path, retry.original = "", msg.text
+	m.confirm = &confirm{act: msg.act, key: msg.key, targets: []target{{id: msg.id, name: msg.id, obj: msg.obj}},
+		diff: msg.diff, retry: &retry}
 	m.mode, m.input = modeConfirm, ""
 	return nil
+}
+
+// refused reports whether err is the server rejecting a manifest, which
+// is worth editing again rather than retrying.
+func refused(err error) bool {
+	switch status.Code(err) {
+	case codes.InvalidArgument, codes.AlreadyExists, codes.FailedPrecondition:
+		return true
+	}
+	return apierrors.IsInvalid(err) || apierrors.IsBadRequest(err) || apierrors.IsAlreadyExists(err)
+}
+
+// editAgain reopens the editor on a refused manifest with the server's
+// error on top. Saving it unchanged cancels, as kubectl edit does.
+func (m *Model) editAgain(retry *editMsg, err error) tea.Cmd {
+	again := errorPrefix + strings.ReplaceAll(errString(err), "\n", "\n"+errorPrefix) + "\n" + retry.original
+	return writeManifest(*retry, again)
 }
 
 // parseManifest reads one protojson-shaped YAML document strictly, so a
 // typo is an error rather than a dropped field, and checks what ateapi
 // needs before anything is sent.
-func parseManifest(k kind, data []byte) (proto.Message, string, error) {
+func parseManifest(k kind, data []byte) (any, string, error) {
 	j, err := yaml.YAMLToJSON(data)
 	if err != nil {
 		return nil, "", fmt.Errorf("invalid YAML: %w", err)
@@ -277,6 +335,9 @@ func uncomment(s string) string {
 // cloneManifest is obj as a manifest, without the fields the server sets,
 // and with "-copy" on its name.
 func cloneManifest(obj any) (string, error) {
+	if o, ok := obj.(metav1.Object); ok {
+		return cloneKube(o)
+	}
 	var c proto.Message
 	switch o := obj.(type) {
 	case *ateapi.Atespace:
@@ -327,6 +388,9 @@ func (m *Model) starterManifest(k kind) string {
 		case *ateapi.ActorTemplate:
 			as, tpl = o.GetMetadata().GetAtespace(), o.GetMetadata().GetName()
 		}
+	}
+	if kubeKind(k) {
+		return m.starterKube(k)
 	}
 	switch k {
 	case kAtespaces:

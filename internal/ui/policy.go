@@ -241,6 +241,22 @@ func bindingLines(bs []*ateapi.Binding) []string {
 	return out
 }
 
+// openObjectEvents lists the Kubernetes events about an ate CRD.
+func (m *Model) openObjectEvents(namespace, kind, name string) tea.Cmd {
+	id := name
+	if namespace != "" {
+		id = namespace + "/" + name
+	}
+	return m.openFetched(stTitleKind.Render("events")+" "+stTitleCount.Render(kind+" "+id),
+		func(ctx context.Context, b Backend) []string {
+			evs, err := b.ObjectEvents(ctx, namespace, kind, name)
+			if err != nil {
+				return []string{stStatusErr.Render("events: " + errString(err))}
+			}
+			return renderEvents(evs, time.Now())
+		})
+}
+
 // openEvents lists the Kubernetes events for a worker pod.
 func (m *Model) openEvents(namespace, pod string) tea.Cmd {
 	return m.openFetched(stTitleKind.Render("events")+" "+stTitleCount.Render(namespace+"/"+pod),
