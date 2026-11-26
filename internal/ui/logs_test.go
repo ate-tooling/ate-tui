@@ -373,3 +373,37 @@ func BenchmarkLogRebuild(b *testing.B) {
 		m.rebuildLogs()
 	}
 }
+
+func TestFormatLogLineContainerJSON(t *testing.T) {
+	const labels = `"labels":{"ate.actor.container.name":"harness","ate.actor.name":"a1","ate.atespace":"research"%s}`
+	line := func(fields, extraLabels string) []byte {
+		return []byte("{" + fmt.Sprintf(labels, extraLabels) + `,"time":"2026-11-26T21:37:23.148Z"` + fields + "}")
+	}
+	tests := []struct {
+		name, fields, labels, want string
+	}{
+		{"plain text", `,"message":"hello"`, "", "hello"},
+		{"json without message", `,"output":{"text":"Red"},"stopReason":"end_turn"`, "", `{"output":{"text":"Red"},"stopReason":"end_turn"}`},
+		{"json with message", `,"msg":"call failed","level":"error","error":"a<b"`, "", `call failed {"error":"a<b","level":"error"}`},
+		{"own labels", `,"message":"hi"`, `,"team":"x"`, `hi {"labels":{"team":"x"}}`},
+		{"big number", `,"id":12345678901234567890`, "", `{"id":12345678901234567890}`},
+		{"non-string message", `,"message":{"a":1}`, "", `{"message":{"a":1}}`},
+	}
+	for _, tt := range tests {
+		l, ok := formatLogLine(line(tt.fields, tt.labels), "research", "a1")
+		if !ok {
+			t.Fatalf("%s: line not kept", tt.name)
+		}
+		if l.msg != tt.want {
+			t.Errorf("%s: msg %q, want %q", tt.name, l.msg, tt.want)
+		}
+	}
+}
+
+func TestFormatLogLineLifecycleHidesTrace(t *testing.T) {
+	b := []byte(`{"time":"2026-11-26T21:37:23Z","message":"Actor resumed","trace_id":"abc","labels":{"ate.actor.name":"a1","ate.atespace":"research"}}`)
+	l, ok := formatLogLine(b, "research", "a1")
+	if !ok || l.msg != "Actor resumed" {
+		t.Fatalf("msg %q ok %v", l.msg, ok)
+	}
+}

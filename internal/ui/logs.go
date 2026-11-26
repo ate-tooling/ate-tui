@@ -627,33 +627,82 @@ func formatLogLine(b []byte, atespace, name string) (logLine, bool) {
 		return logLine{}, false
 	}
 	container, _ := labels[labelContainer].(string)
-	msg, _ := m["message"].(string)
-	if msg == "" {
-		msg, _ = m["msg"].(string)
-	}
 	ts := ""
 	for _, k := range []string{"time", "timestamp", "ts"} {
 		if s, ok := m[k].(string); ok {
 			if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
 				ts = t.Local().Format("15:04:05")
+				delete(m, k)
 			}
 			break
 		}
 	}
 	kind, src := lineLifecycle, stLogLifecycle.Render("lifecycle")
+	msg := ""
 	if container != "" {
 		kind, src = lineContainer, stLogContainer.Render(container)
+		msg = containerMessage(m)
+	} else if msg, _ = m["message"].(string); msg == "" {
+		msg, _ = m["msg"].(string)
 	}
 	return newLogLine(kind, stLogTime.Render(ts)+" "+src+" ", msg, false), true
 }
 
+// containerMessage renders a container line. The worker wraps plain text as
+// message and merges a JSON line's fields into its record, so the fields left
+// after the worker's own are the container's: its message or msg, then the
+// rest as compact JSON.
+func containerMessage(m map[string]any) string {
+	for _, k := range labelKeys {
+		l, ok := m[k].(map[string]any)
+		if !ok {
+			continue
+		}
+		for lk := range l {
+			if strings.HasPrefix(lk, "ate.") {
+				delete(l, lk)
+			}
+		}
+		if len(l) == 0 {
+			delete(m, k)
+		}
+	}
+	msg := ""
+	for _, k := range []string{"message", "msg"} {
+		if s, ok := m[k].(string); ok {
+			msg = s
+			delete(m, k)
+			break
+		}
+	}
+	if len(m) == 0 {
+		return msg
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if enc.Encode(m) != nil {
+		return msg
+	}
+	rest := strings.TrimSpace(buf.String())
+	if msg == "" {
+		return rest
+	}
+	return msg + " " + rest
+}
+
+// labelKeys are the spellings of the worker's label group.
+var labelKeys = []string{"logging.googleapis.com/labels", "labels"}
+
 // parseWorkerLine decodes a worker JSON line and its labels. ok is false
 // for other output and for the sandbox's own lines.
 func parseWorkerLine(b []byte) (m, labels map[string]any, ok bool) {
-	if json.Unmarshal(b, &m) != nil {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
+	if dec.Decode(&m) != nil || m == nil {
 		return nil, nil, false
 	}
-	for _, k := range []string{"logging.googleapis.com/labels", "labels"} {
+	for _, k := range labelKeys {
 		if l, ok := m[k].(map[string]any); ok {
 			labels = l
 			break
