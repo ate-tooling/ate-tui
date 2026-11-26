@@ -93,13 +93,16 @@ func logModel(t *testing.T, b *logBackend) *Model {
 	return m
 }
 
-// run waits for one command's message.
+// run waits for one command's message, running a held wait too.
 func run(t *testing.T, cmd tea.Cmd) tea.Msg {
 	t.Helper()
 	done := make(chan tea.Msg, 1)
 	go func() { done <- cmd() }()
 	select {
 	case msg := <-done:
+		if h, ok := msg.(heldMsg); ok {
+			return run(t, h.cmd)
+		}
 		return msg
 	case <-time.After(5 * time.Second):
 		t.Fatal("command did not return")

@@ -109,6 +109,9 @@ type Model struct {
 	lastClick     time.Time
 	// edit runs the editor on a file; nil runs $EDITOR. Tests set it.
 	edit func(path string, done func(error) tea.Msg) tea.Cmd
+	// holdWaits makes wait hand back its commands as heldMsg. Tests set it
+	// so their driver can tell a wait from a command that is only slow.
+	holdWaits bool
 	// wide shows every column and hides none on a narrow terminal (w).
 	wide bool
 
@@ -212,7 +215,20 @@ func (m *Model) Close() {
 }
 
 func (m *Model) tick() tea.Cmd {
-	return tea.Tick(m.opts.Refresh, func(t time.Time) tea.Msg { return tickMsg(t) })
+	return m.wait(tea.Tick(m.opts.Refresh, func(t time.Time) tea.Msg { return tickMsg(t) }))
+}
+
+// heldMsg carries a command that waits on the clock or a stream rather
+// than doing work. Only a model with holdWaits set sends it.
+type heldMsg struct{ cmd tea.Cmd }
+
+// wait marks c as one that blocks until something outside happens: the
+// next refresh tick or the next log lines.
+func (m *Model) wait(c tea.Cmd) tea.Cmd {
+	if !m.holdWaits {
+		return c
+	}
+	return func() tea.Msg { return heldMsg{c} }
 }
 
 func (m *Model) keyFor(k kind) viewKey {

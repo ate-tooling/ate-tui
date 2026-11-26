@@ -323,7 +323,7 @@ func (m *Model) runStream(ns, pod string, opts *corev1.PodLogOptions, after, unt
 	s.stream, s.cancel, s.ns, s.pod = m.gen, cancel, ns, pod
 	s.ch = make(chan logLine, 4096)
 	go streamLogs(ctx, m.backend, ns, pod, opts, s.ref, after, until, s.ch)
-	return waitLines(s.ch, s.gen, s.stream)
+	return m.wait(waitLines(s.ch, s.gen, s.stream))
 }
 
 // streamLogs reads one pod's lines for one actor until the stream ends or
@@ -394,7 +394,7 @@ func (m *Model) logChunk(msg logChunkMsg) tea.Cmd {
 		s.stop()
 		return nil
 	}
-	return waitLines(s.ch, s.gen, s.stream)
+	return m.wait(waitLines(s.ch, s.gen, s.stream))
 }
 
 // appendLogs adds lines, drops the oldest past maxLogLines, and renders only

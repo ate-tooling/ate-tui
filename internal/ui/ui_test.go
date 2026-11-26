@@ -14,8 +14,15 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-// drive runs cmds synchronously, skipping ticks, and feeds results back.
+// driveTimeout bounds one command. Waits are held rather than timed out,
+// so only a hung command reaches it.
+const driveTimeout = 10 * time.Second
+
+// drive runs cmds synchronously and feeds results back. It skips the
+// commands the model marks as waits (refresh ticks, log lines) and waits
+// for every other one.
 func drive(m *Model, cmd tea.Cmd) {
+	m.holdWaits = true
 	if cmd == nil {
 		return
 	}
@@ -24,15 +31,15 @@ func drive(m *Model, cmd tea.Cmd) {
 	var msg tea.Msg
 	select {
 	case msg = <-done:
-	case <-time.After(500 * time.Millisecond):
-		return // a tick or a blocking log wait
+	case <-time.After(driveTimeout):
+		panic(fmt.Sprintf("drive: command did not return in %v", driveTimeout))
 	}
 	switch msg := msg.(type) {
 	case tea.BatchMsg:
 		for _, c := range msg {
 			drive(m, c)
 		}
-	case nil, tickMsg:
+	case nil, tickMsg, heldMsg:
 	default:
 		_, next := m.Update(msg)
 		drive(m, next)
