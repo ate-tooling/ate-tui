@@ -11,27 +11,27 @@ import (
 )
 
 // fakeEditor answers each editor run with the next edit, given what the
-// file held. It records every version it saw.
+// file held. It records every version it saw. The edit happens when Update
+// opens the editor, on the test goroutine, so a command drive abandons on a
+// slow runner cannot write seen while the test reads it.
 func fakeEditor(t *testing.T, m *Model, edits ...func(string) string) *[]string {
 	t.Helper()
 	var seen []string
 	m.edit = func(path string, done func(error) tea.Msg) tea.Cmd {
-		return func() tea.Msg {
-			b, err := os.ReadFile(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			seen = append(seen, string(b))
-			if len(edits) == 0 {
-				t.Fatal("editor opened more often than expected")
-			}
-			next := edits[0](string(b))
-			edits = edits[1:]
-			if err := os.WriteFile(path, []byte(next), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			return done(nil)
+		b, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
 		}
+		seen = append(seen, string(b))
+		if len(edits) == 0 {
+			t.Fatal("editor opened more often than expected")
+		}
+		next := edits[0](string(b))
+		edits = edits[1:]
+		if err := os.WriteFile(path, []byte(next), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return func() tea.Msg { return done(nil) }
 	}
 	return &seen
 }
