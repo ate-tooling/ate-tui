@@ -14,6 +14,8 @@ import (
 	"github.com/ate-tooling/ate-tui/internal/skin"
 	"github.com/ate-tooling/ate-tui/internal/ui"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/go-logr/logr"
+	"k8s.io/klog/v2"
 )
 
 var version = "dev"
@@ -61,6 +63,8 @@ func main() {
 		if d, _ := cfg.RefreshInterval(); d > 0 {
 			refresh = d
 		}
+	} else if refresh < config.MinRefresh {
+		fail("--refresh: %s is below the %s minimum", refresh, config.MinRefresh)
 	}
 	if !set["a"] {
 		atespace = cfg.Atespace
@@ -141,6 +145,11 @@ func main() {
 		}
 		contexts = func() ([]ui.KubeContext, error) { return demoContexts, nil }
 	}
+
+	// client-go reports port-forward and stream errors through klog, which
+	// writes to stderr: over the TUI's screen. ate-tui shows the errors it
+	// needs itself.
+	klog.SetLogger(logr.Discard())
 
 	ui.ApplySkin(palette)
 	out := ui.NewOutput(os.Stdout)

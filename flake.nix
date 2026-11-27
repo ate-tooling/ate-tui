@@ -23,7 +23,7 @@
           src = self;
           # Update after a go.mod change: set lib.fakeHash, run nix build,
           # and copy the hash it reports.
-          vendorHash = "sha256-9eGMcxWUfe3+2XAftVQ+GZPt9gz0VY4EApMxw8sQ5sE=";
+          vendorHash = "sha256-2ZUAS/v4FoX1qOCLv5vfu24wU2k7JS6eK0vfnB2kctY=";
           subPackages = [ "cmd/ate-tui" ];
           env.CGO_ENABLED = 0;
           ldflags = [

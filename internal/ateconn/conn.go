@@ -11,11 +11,13 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	ateapi "go.ate.dev/substrate/api/ateapi/v1"
 	atev1 "go.ate.dev/substrate/pkg/client/clientset/versioned"
@@ -152,7 +154,7 @@ func Connect(ctx context.Context, opts Options) (*Conn, error) {
 
 	endpoint := opts.Endpoint
 	if endpoint == "" {
-		port, stop, err := servicePortForward(ctx, config, kc, SystemNamespace(), envOr(apiServiceEnv, defaultAPIService), 443)
+		port, stop, err := supervisedPortForward(ctx, config, kc, SystemNamespace(), envOr(apiServiceEnv, defaultAPIService), 443)
 		if err != nil {
 			return nil, err
 		}
@@ -163,7 +165,7 @@ func Connect(ctx context.Context, opts Options) (*Conn, error) {
 
 	// Verify the server before attaching the bearer token: the token must
 	// never go over an unauthenticated channel.
-	tlsCfg, err := serverTLSConfig(ctx, kc)
+	tlsCfg, err := serverTLSConfig(ctx, kc, apiServerName())
 	if err != nil {
 		conn.Close()
 		return nil, err
@@ -187,7 +189,91 @@ func Connect(ctx context.Context, opts Options) (*Conn, error) {
 	return conn, nil
 }
 
-func serverTLSConfig(ctx context.Context, kc kubernetes.Interface) (*tls.Config, error) {
+// serverTLSConfig verifies serverName's certificate against the live
+// servicedns ClusterTrustBundles. The signer rotates its CA, so a
+// certificate the bundles read last do not verify reads them again (at most
+// once a minute) before the handshake fails.
+func serverTLSConfig(ctx context.Context, kc kubernetes.Interface, serverName string) (*tls.Config, error) {
+	ts, err := newTrustStore(ctx, kc)
+	if err != nil {
+		return nil, err
+	}
+	return ts.tlsConfig(serverName), nil
+}
+
+func newTrustStore(ctx context.Context, kc kubernetes.Interface) (*trustStore, error) {
+	pool, err := trustPool(ctx, kc)
+	if err != nil {
+		return nil, err
+	}
+	return &trustStore{kube: kc, pool: pool, fetched: time.Now()}, nil
+}
+
+func (ts *trustStore) tlsConfig(serverName string) *tls.Config {
+	return &tls.Config{
+		MinVersion: tls.VersionTLS13,
+		ServerName: serverName,
+		// The standard verification, against a pool that can change, is
+		// done by VerifyConnection.
+		InsecureSkipVerify: true,
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			return ts.verify(cs.PeerCertificates, serverName)
+		},
+	}
+}
+
+const trustRefetchEvery = time.Minute
+
+type trustStore struct {
+	kube kubernetes.Interface
+
+	mu      sync.Mutex
+	pool    *x509.CertPool
+	fetched time.Time
+}
+
+func (t *trustStore) verify(certs []*x509.Certificate, serverName string) error {
+	if len(certs) == 0 {
+		return errors.New("tls: server presented no certificate")
+	}
+	opts := x509.VerifyOptions{DNSName: serverName, Intermediates: x509.NewCertPool()}
+	for _, c := range certs[1:] {
+		opts.Intermediates.AddCert(c)
+	}
+	t.mu.Lock()
+	opts.Roots = t.pool
+	stale := time.Since(t.fetched) >= trustRefetchEvery
+	t.mu.Unlock()
+	_, err := certs[0].Verify(opts)
+	if err == nil || !stale {
+		return err
+	}
+	// One handshake reads the bundles again; the others meanwhile verify
+	// against what is there and do not wait on the apiserver.
+	t.mu.Lock()
+	if time.Since(t.fetched) < trustRefetchEvery {
+		opts.Roots = t.pool
+		t.mu.Unlock()
+		_, err = certs[0].Verify(opts)
+		return err
+	}
+	t.fetched = time.Now()
+	t.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pool, ferr := trustPool(ctx, t.kube)
+	if ferr != nil {
+		return err
+	}
+	t.mu.Lock()
+	t.pool = pool
+	t.mu.Unlock()
+	opts.Roots = pool
+	_, err = certs[0].Verify(opts)
+	return err
+}
+
+func trustPool(ctx context.Context, kc kubernetes.Interface) (*x509.CertPool, error) {
 	pems, err := listTrustBundles(ctx, kc)
 	if err != nil {
 		return nil, err
@@ -201,7 +287,7 @@ func serverTLSConfig(ctx context.Context, kc kubernetes.Interface) (*tls.Config,
 	if len(pems) == 0 {
 		return nil, fmt.Errorf("no live ClusterTrustBundle found for signer %q", serviceDNSSignerName)
 	}
-	return &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: pool, ServerName: apiServerName()}, nil
+	return pool, nil
 }
 
 // listTrustBundles returns the live servicedns bundles by name, from the v1
@@ -234,26 +320,94 @@ func bearerToken(ctx context.Context, kc kubernetes.Interface, tokenFile string)
 	if tokenFile != "" {
 		return grpc.WithPerRPCCredentials(fileToken(tokenFile)), nil
 	}
-	exp := int64(3600)
+	t := &mintedToken{kube: kc}
+	// Mint now, so a missing ServiceAccount or RBAC fails the connect.
+	if _, err := t.GetRequestMetadata(ctx); err != nil {
+		return nil, err
+	}
+	return grpc.WithPerRPCCredentials(t), nil
+}
+
+// tokenLifetime is what the TokenRequest asks for; the token is minted again
+// once half of what was granted has passed, so a session outlives it.
+const tokenLifetime = time.Hour
+
+// mintedToken is an ate-client ServiceAccount token, minted again before it
+// expires.
+type mintedToken struct {
+	kube kubernetes.Interface
+
+	mu        sync.Mutex
+	token     string
+	expires   time.Time
+	refreshAt time.Time
+}
+
+// mintTimeout bounds a mint. It does not take the deadline of the RPC that
+// asked: a short one would fail the mint for every RPC waiting on it.
+const mintTimeout = 30 * time.Second
+
+func (t *mintedToken) GetRequestMetadata(ctx context.Context, _ ...string) (map[string]string, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now := time.Now()
+	switch {
+	case t.token != "" && now.Before(t.refreshAt):
+	case t.token != "" && now.Before(t.expires):
+		// Still valid: mint the next one in the background, and use this
+		// one meanwhile. A failure keeps it, and tries again in a minute.
+		t.refreshAt = now.Add(time.Minute)
+		go t.refresh()
+	default:
+		// No valid token: every RPC waits for this one mint.
+		mctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), mintTimeout)
+		defer cancel()
+		token, exp, err := mintToken(mctx, t.kube)
+		if err != nil {
+			return nil, err
+		}
+		t.set(token, exp, time.Now())
+	}
+	return map[string]string{"authorization": "Bearer " + t.token}, nil
+}
+
+func (t *mintedToken) refresh() {
+	ctx, cancel := context.WithTimeout(context.Background(), mintTimeout)
+	defer cancel()
+	token, exp, err := mintToken(ctx, t.kube)
+	if err != nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.set(token, exp, time.Now())
+}
+
+func (t *mintedToken) set(token string, exp, now time.Time) {
+	t.token, t.expires = token, exp
+	t.refreshAt = now.Add(exp.Sub(now) / 2)
+}
+
+func (*mintedToken) RequireTransportSecurity() bool { return true }
+
+func mintToken(ctx context.Context, kc kubernetes.Interface) (string, time.Time, error) {
+	exp := int64(tokenLifetime / time.Second)
+	requested := time.Now()
 	tr, err := kc.CoreV1().ServiceAccounts(SystemNamespace()).CreateToken(ctx, envOr(clientSAEnv, defaultClientSA), &authv1.TokenRequest{
 		Spec: authv1.TokenRequestSpec{Audiences: []string{apiServerName()}, ExpirationSeconds: &exp},
 	}, metav1.CreateOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("request ateapi bearer token: %w", err)
+		return "", time.Time{}, fmt.Errorf("request ateapi bearer token: %w", err)
 	}
 	if tr.Status.Token == "" {
-		return nil, fmt.Errorf("request ateapi bearer token: token response was empty")
+		return "", time.Time{}, fmt.Errorf("request ateapi bearer token: token response was empty")
 	}
-	return grpc.WithPerRPCCredentials(staticToken(tr.Status.Token)), nil
+	expires := tr.Status.ExpirationTimestamp.Time
+	if expires.IsZero() || !expires.After(requested) {
+		expires = requested.Add(tokenLifetime)
+	}
+	return tr.Status.Token, expires, nil
 }
-
-type staticToken string
-
-func (t staticToken) GetRequestMetadata(context.Context, ...string) (map[string]string, error) {
-	return map[string]string{"authorization": "Bearer " + string(t)}, nil
-}
-
-func (staticToken) RequireTransportSecurity() bool { return true }
 
 type fileToken string
 

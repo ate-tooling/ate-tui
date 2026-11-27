@@ -77,11 +77,10 @@ func (c *Conn) router(ctx context.Context) (*routerDialer, error) {
 	if c.routerDialer != nil {
 		return c.routerDialer, nil
 	}
-	tlsCfg, err := serverTLSConfig(ctx, c.Kube)
+	tlsCfg, err := serverTLSConfig(ctx, c.Kube, routerServerName())
 	if err != nil {
 		return nil, err
 	}
-	tlsCfg.ServerName = routerServerName()
 	certs := &routerClientCerts{kube: c.Kube}
 	if _, err := certs.get(ctx); err != nil {
 		return nil, err

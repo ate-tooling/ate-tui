@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -133,18 +134,38 @@ func Start(actor, addr string, m Mapping, dial DialFunc) (*Forward, error) {
 
 func (f *Forward) serve() {
 	defer close(f.done)
+	var backoff time.Duration
 	for {
 		c, err := f.lis.Accept()
 		if err != nil {
 			if f.ctx.Err() == nil && !errors.Is(err, net.ErrClosed) {
-				f.mu.Lock()
-				f.stopErr = err
-				f.mu.Unlock()
+				// Out of file descriptors and the like pass: keep the
+				// forward and its tunnels, and try again shortly, like
+				// net/http does.
+				var ne net.Error
+				if errors.As(err, &ne) && ne.Timeout() || isTemporary(err) {
+					backoff = min(max(backoff*2, 5*time.Millisecond), time.Second)
+					f.mu.Lock()
+					f.lastErr, f.errAt = "accept: "+err.Error(), time.Now()
+					f.mu.Unlock()
+					select {
+					case <-time.After(backoff):
+						continue
+					case <-f.ctx.Done():
+					}
+				} else {
+					f.mu.Lock()
+					f.stopErr = err
+					f.mu.Unlock()
+				}
 			}
 			f.cancel()
+			// Free the port, so the forward can be started again.
+			_ = f.lis.Close()
 			f.wg.Wait()
 			return
 		}
+		backoff = 0
 		f.wg.Add(1)
 		go func() {
 			defer f.wg.Done()
@@ -227,4 +248,12 @@ func (f *Forward) Stats() Stats {
 	default:
 	}
 	return s
+}
+
+// isTemporary reports an Accept error that passes: running out of file
+// descriptors or buffers, or a connection reset before it was accepted.
+func isTemporary(err error) bool {
+	return errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) ||
+		errors.Is(err, syscall.ENOBUFS) || errors.Is(err, syscall.ENOMEM) ||
+		errors.Is(err, syscall.ECONNABORTED) || errors.Is(err, syscall.ECONNRESET)
 }
