@@ -46,6 +46,9 @@ func (b *Backend) migrate(now time.Time) {
 		b.suspended(a)
 		a.Metadata.UpdateTime = ts(now)
 	case want != nil && cur != want.Metadata.Name:
+		if !canPlace(want, a) {
+			return // the worker is not ACTIVE or is full: stay put this phase
+		}
 		if a.Status.State == ateapi.ActorState_ACTOR_STATE_RUNNING {
 			b.suspended(a)
 		}

@@ -98,10 +98,15 @@ func Actor(in ActorInput) Report {
 		r.fact("Pool", wa.GetWorkerPool())
 		r.fact("Runtime", runtimeString(wa.GetSandboxRuntime()))
 	}
-	r.fact("Updated", Age(md.GetUpdateTime().AsTime(), in.Now)+" ago")
-	r.fact("Created", Age(md.GetCreateTime().AsTime(), in.Now)+" ago")
+	r.fact("Updated", ago(md.GetUpdateTime(), in.Now))
+	r.fact("Created", ago(md.GetCreateTime(), in.Now))
 
-	sinceUpdate := in.Now.Sub(md.GetUpdateTime().AsTime())
+	// sinceUpdate is negative when update_time is unset, so stuck says
+	// nothing about how long the transition has lasted.
+	sinceUpdate := time.Duration(-1)
+	if u := md.GetUpdateTime(); u != nil && u.AsTime().Unix() > 0 {
+		sinceUpdate = in.Now.Sub(u.AsTime())
+	}
 	ref := fmt.Sprintf("%s -a %s", md.GetName(), md.GetAtespace())
 
 	switch st.GetState() {
@@ -155,6 +160,10 @@ func Actor(in ActorInput) Report {
 }
 
 func stuck(r *Report, state string, since time.Duration) {
+	if since < 0 {
+		r.add(Info, state, "the actor has no update time, so how long it has been "+strings.ToLower(state)+" is unknown")
+		return
+	}
 	if since > StuckAfter {
 		r.add(Warn, fmt.Sprintf("%s for %s", state, roundDur(since)),
 			fmt.Sprintf("transitions normally finish in seconds; anything over %s is unusual", StuckAfter))
@@ -193,6 +202,8 @@ func checkSnapshots(r *Report, st *ateapi.ActorStatus) {
 		}
 		return
 	}
+	// Sort a copy: st may be a cached object other goroutines read.
+	snaps = append([]*ateapi.Snapshot(nil), snaps...)
 	sort.Slice(snaps, func(i, j int) bool { return snaps[i].GetGeneration() > snaps[j].GetGeneration() })
 	var lines []string
 	durable := false
@@ -532,6 +543,11 @@ func SandboxConfig(c *infrav1.SandboxConfig, pools []*infrav1.WorkerPool, now ti
 		r.Summary = "SandboxConfig is being deleted, but pools still use it."
 		r.add(Warn, fmt.Sprintf("Deleting since %s ago; %d pool(s) hold it", Age(c.DeletionTimestamp.Time, now), held),
 			"point those pools at another SandboxConfig (spec.sandboxClasses[].configRef); the controller then releases it")
+	case c.DeletionTimestamp != nil && pools == nil && hasFinalizer(c.Finalizers, infrav1.SandboxConfigWorkerPoolProtectionFinalizer):
+		r.Summary = "SandboxConfig is being deleted."
+		r.add(Warn, fmt.Sprintf("Deleting since %s ago; its finalizer stays while pools use it", Age(c.DeletionTimestamp.Time, now)),
+			"WorkerPools could not be listed, so whether pools still use it is unknown",
+			"check spec.sandboxClasses[].configRef on the WorkerPools with an account that can list them")
 	case c.DeletionTimestamp != nil && hasFinalizer(c.Finalizers, infrav1.SandboxConfigWorkerPoolProtectionFinalizer):
 		r.Summary = "SandboxConfig is being deleted."
 		r.add(Warn, fmt.Sprintf("Deleting since %s ago; waiting for atecontroller to remove its finalizer", Age(c.DeletionTimestamp.Time, now)),
@@ -580,8 +596,8 @@ func checkPodEvents(r *Report, namespace, pod string, events []corev1.Event, now
 			break
 		}
 		count := ""
-		if e.Count > 1 {
-			count = fmt.Sprintf(" x%d", e.Count)
+		if n := EventCount(&e); n > 1 {
+			count = fmt.Sprintf(" x%d", n)
 		}
 		lines = append(lines, fmt.Sprintf("%s%s, %s ago: %s", e.Reason, count, Age(EventTime(&e), now), e.Message))
 	}
@@ -590,17 +606,30 @@ func checkPodEvents(r *Report, namespace, pod string, events []corev1.Event, now
 }
 
 // EventTime is when an event last happened, from whichever field the
-// reporter set.
+// reporter set. events.k8s.io recorders leave LastTimestamp zero, keep
+// EventTime at the first occurrence and record repeats in Series.
 func EventTime(e *corev1.Event) time.Time {
 	switch {
 	case !e.LastTimestamp.IsZero():
 		return e.LastTimestamp.Time
+	case e.Series != nil && !e.Series.LastObservedTime.IsZero():
+		return e.Series.LastObservedTime.Time
 	case !e.EventTime.IsZero():
 		return e.EventTime.Time
 	case !e.FirstTimestamp.IsZero():
 		return e.FirstTimestamp.Time
 	}
 	return e.CreationTimestamp.Time
+}
+
+// EventCount is how many times an event happened: Count from core/v1
+// recorders or Series.Count from events.k8s.io ones, whichever is larger.
+func EventCount(e *corev1.Event) int32 {
+	n := e.Count
+	if e.Series != nil && e.Series.Count > n {
+		n = e.Series.Count
+	}
+	return n
 }
 
 func findWorker(ws []*ateapi.Worker, name string) *ateapi.Worker {

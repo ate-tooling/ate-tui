@@ -268,3 +268,99 @@ func TestSandboxConfig(t *testing.T) {
 		}
 	}
 }
+
+func TestTransitionWithoutUpdateTime(t *testing.T) {
+	for _, s := range []ateapi.ActorState{ateapi.ActorState_ACTOR_STATE_RESUMING, ateapi.ActorState_ACTOR_STATE_SUSPENDING,
+		ateapi.ActorState_ACTOR_STATE_REVERTING, ateapi.ActorState_ACTOR_STATE_DELETING} {
+		a := actor(s, 0, func(a *ateapi.Actor) { a.Metadata.UpdateTime, a.Metadata.CreateTime = nil, nil })
+		r := Actor(ActorInput{Actor: a, Now: now})
+		for _, f := range r.Findings {
+			if strings.Contains(f.Title, " for ") {
+				t.Errorf("%v: finding %q claims a duration without update_time", s, f.Title)
+			}
+		}
+		if r.Level == Warn || r.Level == Error {
+			t.Errorf("%v: level %v, want no warning: %+v", s, r.Level, r.Findings)
+		}
+		for _, f := range r.Facts {
+			if (f.Label == "Updated" || f.Label == "Created") && f.Value != "-" {
+				t.Errorf("%v: fact %s = %q, want -", s, f.Label, f.Value)
+			}
+		}
+	}
+}
+
+func TestSnapshotsNotMutated(t *testing.T) {
+	a := actor(ateapi.ActorState_ACTOR_STATE_SUSPENDED, time.Minute, func(a *ateapi.Actor) {
+		a.Status.Snapshots = []*ateapi.Snapshot{{Generation: 1}, {Generation: 3}, {Generation: 2}}
+	})
+	r := Actor(ActorInput{Actor: a, Now: now})
+	for i, want := range []int32{1, 3, 2} {
+		if g := a.Status.Snapshots[i].GetGeneration(); g != want {
+			t.Fatalf("snapshot %d is gen %d, want %d: Actor reordered the caller's slice", i, g, want)
+		}
+	}
+	for _, f := range r.Findings {
+		if strings.Contains(f.Title, "snapshot generation") && !strings.HasPrefix(f.Detail[0], "gen 3") {
+			t.Errorf("detail not newest first: %q", f.Detail)
+		}
+	}
+}
+
+func TestSeriesEvent(t *testing.T) {
+	// An events.k8s.io recorder: EventTime is the first occurrence,
+	// repeats go in Series, LastTimestamp stays zero.
+	e := corev1.Event{Type: corev1.EventTypeWarning, Reason: "FailedScheduling", Message: "0/3 nodes",
+		EventTime: metav1.NewMicroTime(now.Add(-3 * time.Hour)),
+		Series:    &corev1.EventSeries{Count: 40, LastObservedTime: metav1.NewMicroTime(now.Add(-2 * time.Minute))}}
+	if got := EventTime(&e); !got.Equal(now.Add(-2 * time.Minute)) {
+		t.Errorf("EventTime = %v, want Series.LastObservedTime", got)
+	}
+	if got := EventCount(&e); got != 40 {
+		t.Errorf("EventCount = %d, want 40", got)
+	}
+	if got := EventCount(&corev1.Event{Count: 5, Series: &corev1.EventSeries{Count: 2}}); got != 5 {
+		t.Errorf("EventCount = %d, want the larger Count 5", got)
+	}
+	running := actor(ateapi.ActorState_ACTOR_STATE_RUNNING, time.Minute, func(a *ateapi.Actor) {
+		a.Status.WorkerAssignment = &ateapi.WorkerAssignment{Worker: &ateapi.ObjectRef{Name: "w1"}, WorkerNamespace: "ns", WorkerPod: "w1-pod"}
+	})
+	r := Actor(ActorInput{Actor: running, PodEvents: []corev1.Event{e}, Now: now})
+	found := false
+	for _, f := range r.Findings {
+		if strings.Contains(f.Title, "Warning event") {
+			found = true
+			if len(f.Detail) != 1 || f.Detail[0] != "FailedScheduling x40, 2m ago: 0/3 nodes" {
+				t.Errorf("detail %q", f.Detail)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("recurring series warning was filtered out: %+v", r.Findings)
+	}
+}
+
+func TestBytesRounding(t *testing.T) {
+	for in, want := range map[int64]string{1048575: "1Mi", 1023: "1023B", 1024: "1Ki", 1<<30 - 1: "1Gi", 1<<20 + 1<<19: "1.5Mi", 1 << 62: "4Ei"} {
+		if got := Bytes(in); got != want {
+			t.Errorf("Bytes(%d) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestSandboxConfigDeletingPoolsUnknown(t *testing.T) {
+	d := metav1.NewTime(now.Add(-10 * time.Minute))
+	c := &infrav1.SandboxConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "gv", DeletionTimestamp: &d, Finalizers: []string{infrav1.SandboxConfigWorkerPoolProtectionFinalizer}},
+		Spec:       infrav1.SandboxConfigSpec{SandboxClass: infrav1.SandboxClassGvisor, DefaultVersion: "v1", Versions: []infrav1.SandboxVersionConfig{{Name: "v1"}}},
+	}
+	r := SandboxConfig(c, nil, now)
+	for _, f := range r.Findings {
+		if strings.Contains(f.Title, "atecontroller") || strings.Contains(strings.Join(f.Detail, " "), "atecontroller is running") {
+			t.Errorf("blames atecontroller when pools are unknown: %q %q", f.Title, f.Detail)
+		}
+	}
+	if !hasFinding(r, Warn, "Deleting since 10m ago") {
+		t.Errorf("want deleting warning: %+v", r.Findings)
+	}
+}

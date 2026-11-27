@@ -279,21 +279,25 @@ func (b *Backend) suspended(a *ateapi.Actor) {
 // actor's selector.
 func (b *Backend) pickWorker(a *ateapi.Actor) *ateapi.Worker {
 	for _, i := range b.rng.Perm(len(b.workers)) {
-		w := b.workers[i]
-		if w.Status.State != ateapi.WorkerState_WORKER_STATE_ACTIVE || w.Status.GetAllocated().GetActors() >= w.Status.GetCapacity().GetActors() {
-			continue
-		}
-		ok := true
-		for k, v := range a.GetWorkerSelector().GetMatchLabels() {
-			if w.Labels[k] != v {
-				ok = false
-			}
-		}
-		if ok {
+		if w := b.workers[i]; canPlace(w, a) {
 			return w
 		}
 	}
 	return nil
+}
+
+// canPlace reports whether w is ACTIVE, has a free slot and matches a's
+// selector.
+func canPlace(w *ateapi.Worker, a *ateapi.Actor) bool {
+	if w.Status.State != ateapi.WorkerState_WORKER_STATE_ACTIVE || w.Status.GetAllocated().GetActors() >= w.Status.GetCapacity().GetActors() {
+		return false
+	}
+	for k, v := range a.GetWorkerSelector().GetMatchLabels() {
+		if w.Labels[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 func latency() { time.Sleep(time.Duration(20+rand.Intn(60)) * time.Millisecond) }

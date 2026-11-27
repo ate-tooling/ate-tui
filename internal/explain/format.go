@@ -2,11 +2,13 @@ package explain
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
 
 	ateapi "go.ate.dev/substrate/api/ateapi/v1"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // ActorState renders an ActorState the way the UI shows it.
@@ -55,6 +57,18 @@ func orDash(s string) string {
 	return s
 }
 
+// ago renders a protobuf timestamp as "5m ago", or "-" when unset.
+func ago(t *timestamppb.Timestamp, now time.Time) string {
+	if t == nil {
+		return "-"
+	}
+	a := Age(t.AsTime(), now)
+	if a == "-" {
+		return a
+	}
+	return a + " ago"
+}
+
 // Age renders a duration like kubectl: 5s, 3m, 2h, 4d.
 func Age(t, now time.Time) string {
 	if t.IsZero() || t.Unix() <= 0 {
@@ -99,12 +113,14 @@ func Bytes(b int64) string {
 	if b < unit {
 		return fmt.Sprintf("%dB", b)
 	}
-	div, exp := int64(unit), 0
-	for n := b / unit; n >= unit; n /= unit {
-		div *= unit
+	// Pick the unit after rounding to one decimal, so 1048575 is 1Mi,
+	// not 1024.0Ki.
+	v, exp := float64(b)/unit, 0
+	for math.Round(v*10)/10 >= unit && exp < 5 {
+		v /= unit
 		exp++
 	}
-	v := float64(b) / float64(div)
+	v = math.Round(v*10) / 10
 	if v == float64(int64(v)) {
 		return fmt.Sprintf("%d%ci", int64(v), "KMGTPE"[exp])
 	}
