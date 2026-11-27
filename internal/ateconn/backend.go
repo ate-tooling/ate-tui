@@ -239,7 +239,7 @@ func (c *Conn) CreateTag(ctx context.Context, t *ateapi.Tag) (*ateapi.Tag, error
 
 func (c *Conn) CreateObject(ctx context.Context, obj metav1.Object) (metav1.Object, error) {
 	v1 := c.Ate.AteV1()
-	co := metav1.CreateOptions{FieldManager: fieldManager}
+	co := metav1.CreateOptions{FieldManager: c.clientName}
 	switch o := obj.(type) {
 	case *infrav1.WorkerPool:
 		return asObject(v1.WorkerPools(o.Namespace).Create(ctx, o, co))
@@ -255,7 +255,7 @@ func (c *Conn) CreateObject(ctx context.Context, obj metav1.Object) (metav1.Obje
 // refuse the update with a Conflict when the object changed since it was read.
 func (c *Conn) UpdateObject(ctx context.Context, obj metav1.Object) (metav1.Object, error) {
 	v1 := c.Ate.AteV1()
-	uo := metav1.UpdateOptions{FieldManager: fieldManager}
+	uo := metav1.UpdateOptions{FieldManager: c.clientName}
 	switch o := obj.(type) {
 	case *infrav1.WorkerPool:
 		return asObject(v1.WorkerPools(o.Namespace).Update(ctx, o, uo))
@@ -289,10 +289,8 @@ func (c *Conn) DeleteObject(ctx context.Context, obj metav1.Object) error {
 func (c *Conn) ScaleWorkerPool(ctx context.Context, namespace, name string, replicas int32) (*infrav1.WorkerPool, error) {
 	patch := fmt.Appendf(nil, `{"spec":{"replicas":%d}}`, replicas)
 	return c.Ate.AteV1().WorkerPools(namespace).Patch(ctx, name, types.MergePatchType, patch,
-		metav1.PatchOptions{FieldManager: fieldManager})
+		metav1.PatchOptions{FieldManager: c.clientName})
 }
-
-const fieldManager = "ate-tui"
 
 // asObject keeps a typed nil from becoming a non-nil interface.
 func asObject[T any, P interface {

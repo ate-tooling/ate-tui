@@ -21,7 +21,26 @@ func WorkerState(s ateapi.WorkerState) string {
 	return title(trimEnum(s.String(), "WORKER_STATE_"))
 }
 
+// SnapshotFidelity renders a snapshot's fidelity the way the UI shows it,
+// "-" when unset.
+func SnapshotFidelity(f ateapi.SnapshotFidelity) string {
+	return orDash(title(enumValue(f.String(), "SNAPSHOT_FIDELITY_")))
+}
+
+// TagScope renders a tag's scope the way the UI shows it, "-" when unset.
+func TagScope(s ateapi.TagScope) string {
+	return orDash(title(enumValue(s.String(), "TAG_SCOPE_")))
+}
+
 func trimEnum(s, prefix string) string { return strings.TrimPrefix(s, prefix) }
+
+// enumValue is trimEnum with UNSPECIFIED, the proto zero value, as "".
+func enumValue(s, prefix string) string {
+	if s = trimEnum(s, prefix); s == "UNSPECIFIED" {
+		return ""
+	}
+	return s
+}
 
 func title(s string) string {
 	if s == "" {

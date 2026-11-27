@@ -70,8 +70,6 @@ const (
 
 // logLine is one entry of the logs pager.
 type logLine struct {
-	seq   int
-	stamp time.Time // the kubelet's, the resume cursor
 	kind  lineKind
 	isErr bool
 	head  string // styled time and source
@@ -147,7 +145,7 @@ type logStream struct {
 
 	// The stream in flight; stream is 0 when none is.
 	stream  int
-	ch      chan logLine
+	ch      chan streamedLine
 	cancel  context.CancelFunc
 	ns, pod string
 
@@ -178,8 +176,10 @@ type logStream struct {
 	kept    bool
 	lastErr string
 
+	// entries are numbered from 1 in the order they came: entries[i] is
+	// number dropped+i+1, as rowSeq refers to them.
 	entries []logLine
-	seq     int
+	dropped int
 	bytes   int // the text the entries hold
 
 	source    logSource
@@ -243,7 +243,9 @@ type (
 	logChunkMsg struct {
 		gen, stream int
 		lines       []logLine
-		done        bool
+		// cursor is the kubelet timestamp of the last line that had one.
+		cursor time.Time
+		done   bool
 	}
 	logActorMsg struct {
 		gen   int
@@ -254,25 +256,34 @@ type (
 
 // waitLines blocks off the UI goroutine for the next lines, then drains
 // whatever else is buffered so a burst renders in one frame.
-func waitLines(ch <-chan logLine, gen, stream int) tea.Cmd {
+func waitLines(ch <-chan streamedLine, gen, stream int) tea.Cmd {
 	return func() tea.Msg {
+		msg := logChunkMsg{gen: gen, stream: stream}
+		add := func(l streamedLine) {
+			msg.lines = append(msg.lines, l.line)
+			if !l.stamp.IsZero() {
+				msg.cursor = l.stamp
+			}
+		}
 		l, ok := <-ch
 		if !ok {
-			return logChunkMsg{gen: gen, stream: stream, done: true}
+			msg.done = true
+			return msg
 		}
-		lines := []logLine{l}
-		for len(lines) < 2000 {
+		add(l)
+		for len(msg.lines) < 2000 {
 			select {
 			case l, ok := <-ch:
 				if !ok {
-					return logChunkMsg{gen: gen, stream: stream, lines: lines, done: true}
+					msg.done = true
+					return msg
 				}
-				lines = append(lines, l)
+				add(l)
 			default:
-				return logChunkMsg{gen: gen, stream: stream, lines: lines}
+				return msg
 			}
 		}
-		return logChunkMsg{gen: gen, stream: stream, lines: lines}
+		return msg
 	}
 }
 
@@ -444,19 +455,26 @@ func (m *Model) runStream(ns, pod string, opts *corev1.PodLogOptions, after, unt
 	ctx, cancel := context.WithCancel(context.Background())
 	m.gen++
 	s.stream, s.cancel, s.ns, s.pod = m.gen, cancel, ns, pod
-	s.ch = make(chan logLine, 4096)
+	s.ch = make(chan streamedLine, 4096)
 	go streamLogs(ctx, m.backend, ns, pod, opts, s.ref, after, until, s.ch)
 	return m.wait(waitLines(s.ch, s.gen, s.stream))
+}
+
+// streamedLine is a line as the stream read it: stamp is the kubelet's
+// timestamp, zero when it had none, and where a reconnect resumes.
+type streamedLine struct {
+	line  logLine
+	stamp time.Time
 }
 
 // streamLogs reads one pod's lines for one actor until the stream ends or
 // ctx is cancelled. A line without a kubelet timestamp is always kept.
 func streamLogs(ctx context.Context, b Backend, ns, pod string, opts *corev1.PodLogOptions,
-	ref *ateapi.ObjectRef, after, until time.Time, ch chan<- logLine) {
+	ref *ateapi.ObjectRef, after, until time.Time, ch chan<- streamedLine) {
 	defer close(ch)
-	send := func(l logLine) bool {
+	send := func(l logLine, stamp time.Time) bool {
 		select {
-		case ch <- l:
+		case ch <- streamedLine{l, stamp}:
 			return true
 		case <-ctx.Done():
 			return false
@@ -465,7 +483,7 @@ func streamLogs(ctx context.Context, b Backend, ns, pod string, opts *corev1.Pod
 	rc, err := b.PodLogs(ctx, ns, pod, opts)
 	if err != nil {
 		if ctx.Err() == nil {
-			send(logError("logs " + ns + "/" + pod + ": " + errString(err)))
+			send(logError("logs "+ns+"/"+pod+": "+errString(err)), time.Time{})
 		}
 		return
 	}
@@ -484,17 +502,14 @@ func streamLogs(ctx context.Context, b Backend, ns, pod string, opts *corev1.Pod
 				} else {
 					l, ok = formatLogLine(rest, ref.GetAtespace(), ref.GetName())
 				}
-				if ok {
-					l.stamp = stamp
-					if !send(l) {
-						return
-					}
+				if ok && !send(l, stamp) {
+					return
 				}
 			}
 		}
 		if err != nil {
 			if err != io.EOF && ctx.Err() == nil {
-				send(logError("logs " + ns + "/" + pod + ": " + err.Error()))
+				send(logError("logs "+ns+"/"+pod+": "+err.Error()), time.Time{})
 			}
 			return
 		}
@@ -619,6 +634,9 @@ func (m *Model) logChunk(msg logChunkMsg) tea.Cmd {
 		return nil
 	}
 	m.appendLogs(msg.lines)
+	if !msg.cursor.IsZero() {
+		s.cursor = msg.cursor
+	}
 	if msg.done {
 		// The next poll reconnects, from the cursor if the pod is the same.
 		draining, caughtUp, ns, pod := s.draining, s.catchingUp, s.ns, s.pod
@@ -655,15 +673,10 @@ func (m *Model) appendLogs(lines []logLine) {
 		} else if l.kind != lineNotice {
 			s.lastErr = ""
 		}
-		if !l.stamp.IsZero() {
-			s.cursor = l.stamp
-		}
-		s.seq++
-		l.seq = s.seq
 		s.entries = append(s.entries, l)
 		s.bytes += l.size()
 		if s.shows(&l) {
-			s.addRows(p, &l, width)
+			s.addRows(p, &l, s.dropped+len(s.entries), width)
 		}
 	}
 	over := 0
@@ -675,7 +688,8 @@ func (m *Model) appendLogs(lines []logLine) {
 		n := copy(s.entries, s.entries[over:])
 		clear(s.entries[n:])
 		s.entries = s.entries[:n]
-		s.trimRows(p, s.entries[0].seq)
+		s.dropped += over
+		s.trimRows(p, s.dropped+1)
 	}
 	if p.follow {
 		p.offset = len(p.lines)
@@ -688,7 +702,8 @@ func (l *logLine) size() int {
 	return len(l.head) + len(l.raw) + len(l.msg) + len(l.lower) + len(l.text)
 }
 
-func (s *logStream) addRows(p *pager, l *logLine, width int) {
+// addRows renders l, entry number seq, into p.
+func (s *logStream) addRows(p *pager, l *logLine, seq, width int) {
 	text := l.render(s.query)
 	if s.query != "" && strings.Contains(l.lower, s.query) {
 		s.matches = append(s.matches, len(p.lines))
@@ -709,12 +724,12 @@ func (s *logStream) addRows(p *pager, l *logLine, width int) {
 		}
 		for _, r := range rows {
 			p.lines = append(p.lines, r)
-			s.rowSeq = append(s.rowSeq, l.seq)
+			s.rowSeq = append(s.rowSeq, seq)
 		}
 		return
 	}
 	p.lines = append(p.lines, text)
-	s.rowSeq = append(s.rowSeq, l.seq)
+	s.rowSeq = append(s.rowSeq, seq)
 }
 
 // trimRows drops the rows of entries older than first.
@@ -760,10 +775,11 @@ func (m *Model) rebuildLogs() {
 		if !s.shows(l) {
 			continue
 		}
-		if offset < 0 && l.seq >= top {
+		seq := s.dropped + i + 1
+		if offset < 0 && seq >= top {
 			offset = len(p.lines)
 		}
-		s.addRows(p, l, width)
+		s.addRows(p, l, seq, width)
 	}
 	if !p.follow && offset >= 0 {
 		p.offset = offset

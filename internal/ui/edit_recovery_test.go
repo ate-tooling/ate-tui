@@ -244,7 +244,7 @@ func TestJournalTrimsPastMaxSize(t *testing.T) {
 func TestWriteTempFailureLeavesNoFile(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("TMPDIR", filepath.Join(dir, "missing"))
-	if p, err := writeTemp("x"); err == nil {
+	if p, err := writeTemp(kWorkerPools, "x"); err == nil {
 		os.Remove(p)
 		t.Fatal("writeTemp succeeded in a missing dir")
 	}

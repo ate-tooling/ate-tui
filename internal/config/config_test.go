@@ -33,17 +33,18 @@ func TestLoad(t *testing.T) {
 }
 
 func TestXDGPaths(t *testing.T) {
+	d := For("ate-tui")
 	t.Setenv("XDG_STATE_HOME", "/state")
 	t.Setenv("XDG_CONFIG_HOME", "/cfg")
-	if got := JournalPath(); got != "/state/ate-tui/journal.jsonl" {
+	if got := d.JournalPath(); got != "/state/ate-tui/journal.jsonl" {
 		t.Errorf("JournalPath = %s", got)
 	}
-	if got := Path(); got != "/cfg/ate-tui/config.yaml" {
+	if got := d.Path(); got != "/cfg/ate-tui/config.yaml" {
 		t.Errorf("Path = %s", got)
 	}
 	t.Setenv("XDG_STATE_HOME", "")
 	t.Setenv("HOME", "/home/u")
-	if got := JournalPath(); got != "/home/u/.local/state/ate-tui/journal.jsonl" {
+	if got := d.JournalPath(); got != "/home/u/.local/state/ate-tui/journal.jsonl" {
 		t.Errorf("JournalPath = %s", got)
 	}
 }
@@ -70,13 +71,21 @@ writeContexts: [kind-dev]
 	if err != nil {
 		t.Fatal(err)
 	}
-	d, _ := c.RefreshInterval()
-	if d.String() != "5s" || c.DefaultView != "workers" || c.Atespace != "research" || c.Skin != "catppuccin-latte" ||
-		c.Colors.Red != "#ff0000" || c.Keys["suspend"] != "S" || c.MouseEnabled() || c.ProxyAddress != "0.0.0.0" {
+	if c.Refresh.String() != "5s" || c.DefaultView != "workers" || c.Atespace != "research" || c.Skin != "catppuccin-latte" ||
+		c.Colors.Red != "#ff0000" || c.Keys["suspend"] != "S" || c.Mouse || c.ProxyAddress != "0.0.0.0" {
 		t.Errorf("config %+v", c)
 	}
-	if !(Config{}).MouseEnabled() {
-		t.Error("mouse is off by default")
+	for _, body := range []string{"", "atespace: research\n"} {
+		if body != "" {
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		} else if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		if c, err := Load(path); err != nil || !c.Mouse {
+			t.Errorf("%q: mouse is off by default (%v)", body, err)
+		}
 	}
 }
 

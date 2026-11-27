@@ -260,7 +260,7 @@ func forwardLines(fws []*proxy.Forward, cursor, width int, now time.Time) []stri
 			conns += fmt.Sprintf(" (%d failed)", s.Failed)
 		}
 		cells[i] = []string{f.Actor, f.Local, strconv.Itoa(f.Remote), conns,
-			explain.Bytes(s.In), explain.Bytes(s.Out), age(f.Started, now), status}
+			explain.Bytes(s.In), explain.Bytes(s.Out), age(s.Started, now), status}
 		levels[i] = lv
 		for j, c := range cells[i][:len(cols)-1] {
 			w[j] = max(w[j], min(len(c), maxColWidth))

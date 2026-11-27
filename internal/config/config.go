@@ -15,8 +15,9 @@ import (
 )
 
 type Config struct {
-	// Refresh is the poll interval, as a Go duration ("2s").
-	Refresh string `json:"refresh,omitempty"`
+	// Refresh is the poll interval, at least MinRefresh; 0 when unset. The
+	// file spells it as a Go duration ("2s").
+	Refresh time.Duration `json:"-"`
 	// DefaultView is the kind shown at start ("workers").
 	DefaultView string `json:"defaultView,omitempty"`
 	// Atespace scopes the start view; empty is every atespace.
@@ -27,48 +28,46 @@ type Config struct {
 	Colors skin.Palette `json:"colors,omitempty"`
 	// Keys rebinds table keys: action name → key.
 	Keys map[string]string `json:"keys,omitempty"`
-	// Mouse turns mouse support on (the default) or off.
-	Mouse *bool `json:"mouse,omitempty"`
+	// Mouse is on unless the file turns it off.
+	Mouse bool `json:"-"`
 	// ProxyAddress is where f forwards listen (default 127.0.0.1).
 	ProxyAddress string `json:"proxyAddress,omitempty"`
 	// WriteContexts are kube contexts where ate-tui allows writes.
 	WriteContexts []string `json:"writeContexts,omitempty"`
 }
 
+// file is config.yaml as written: the fields whose spelling differs from
+// Config's take their place.
+type file struct {
+	Config
+	Refresh string `json:"refresh,omitempty"`
+	Mouse   *bool  `json:"mouse,omitempty"`
+}
+
 // MinRefresh keeps a typo from polling ateapi in a tight loop.
 const MinRefresh = 250 * time.Millisecond
 
-// RefreshInterval is Refresh parsed, or 0 when unset.
-func (c Config) RefreshInterval() (time.Duration, error) {
-	if c.Refresh == "" {
-		return 0, nil
-	}
-	d, err := time.ParseDuration(c.Refresh)
-	if err != nil {
-		return 0, fmt.Errorf("refresh: %w", err)
-	}
-	if d < MinRefresh {
-		return 0, fmt.Errorf("refresh: %s is below the %s minimum", d, MinRefresh)
-	}
-	return d, nil
-}
+// Dirs are where a program keeps its files, in the XDG base directories,
+// each in a directory named after the program.
+type Dirs struct{ program string }
 
-// MouseEnabled reports whether the mouse is on.
-func (c Config) MouseEnabled() bool { return c.Mouse == nil || *c.Mouse }
+// For is the directories of the program named program.
+func For(program string) Dirs { return Dirs{program} }
 
-// Path is $XDG_CONFIG_HOME/ate-tui/config.yaml, or ~/.config/ate-tui/config.yaml.
-func Path() string { return xdg("XDG_CONFIG_HOME", ".config", "config.yaml") }
+// Path is $XDG_CONFIG_HOME/<program>/config.yaml, or
+// ~/.config/<program>/config.yaml.
+func (d Dirs) Path() string { return d.xdg("XDG_CONFIG_HOME", ".config", "config.yaml") }
 
 // SkinDir holds custom skins, next to the config file.
-func SkinDir() string { return xdg("XDG_CONFIG_HOME", ".config", "skins") }
+func (d Dirs) SkinDir() string { return d.xdg("XDG_CONFIG_HOME", ".config", "skins") }
 
-// JournalPath is $XDG_STATE_HOME/ate-tui/journal.jsonl, or
-// ~/.local/state/ate-tui/journal.jsonl.
-func JournalPath() string {
-	return xdg("XDG_STATE_HOME", filepath.Join(".local", "state"), "journal.jsonl")
+// JournalPath is $XDG_STATE_HOME/<program>/journal.jsonl, or
+// ~/.local/state/<program>/journal.jsonl.
+func (d Dirs) JournalPath() string {
+	return d.xdg("XDG_STATE_HOME", filepath.Join(".local", "state"), "journal.jsonl")
 }
 
-func xdg(env, fallback, file string) string {
+func (d Dirs) xdg(env, fallback, file string) string {
 	dir := os.Getenv(env)
 	if dir == "" {
 		home, err := os.UserHomeDir()
@@ -77,35 +76,53 @@ func xdg(env, fallback, file string) string {
 		}
 		dir = filepath.Join(home, fallback)
 	}
-	return filepath.Join(dir, "ate-tui", file)
+	return filepath.Join(dir, d.program, file)
 }
 
 // Load reads path. A missing file is an empty config. Unknown fields and
 // values that cannot work are errors, so a typo does not go unnoticed.
 func Load(path string) (Config, error) {
-	var c Config
 	b, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
-		return c, nil
+		return Config{Mouse: true}, nil
 	}
 	if err != nil {
-		return c, err
+		return Config{}, err
 	}
-	if err := yaml.UnmarshalStrict(b, &c); err != nil {
-		return c, fmt.Errorf("%s: %w", path, err)
+	var f file
+	if err := yaml.UnmarshalStrict(b, &f); err != nil {
+		return Config{}, fmt.Errorf("%s: %w", path, err)
 	}
+	c, err := f.check()
+	if err != nil {
+		return Config{}, fmt.Errorf("%s: %w", path, err)
+	}
+	return c, nil
+}
+
+// check turns f into a Config, or says which value cannot work.
+func (f file) check() (Config, error) {
+	c := f.Config
 	for action, key := range c.Keys {
 		// YAML 1.1 reads unquoted y, Y, n, N, yes, no, on and off as
 		// booleans, which arrive here as "true" or "false".
 		if key == "true" || key == "false" {
-			return c, fmt.Errorf(`%s: keys: %s: YAML reads an unquoted y, Y, n, N, on or off as %s; quote the key, e.g. %s: "Y"`, path, action, key, action)
+			return c, fmt.Errorf(`keys: %s: YAML reads an unquoted y, Y, n, N, on or off as %s; quote the key, e.g. %s: "Y"`, action, key, action)
 		}
 	}
-	if _, err := c.RefreshInterval(); err != nil {
-		return c, fmt.Errorf("%s: %w", path, err)
+	if f.Refresh != "" {
+		d, err := time.ParseDuration(f.Refresh)
+		if err != nil {
+			return c, fmt.Errorf("refresh: %w", err)
+		}
+		if d < MinRefresh {
+			return c, fmt.Errorf("refresh: %s is below the %s minimum", d, MinRefresh)
+		}
+		c.Refresh = d
 	}
 	if a := c.ProxyAddress; a != "" && a != "localhost" && net.ParseIP(a) == nil {
-		return c, fmt.Errorf("%s: proxyAddress %q is not an IP address", path, a)
+		return c, fmt.Errorf("proxyAddress %q is not an IP address", a)
 	}
+	c.Mouse = f.Mouse == nil || *f.Mouse
 	return c, nil
 }

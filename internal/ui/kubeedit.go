@@ -251,7 +251,10 @@ func cloneKube(o metav1.Object) (string, error) {
 // starterKube is a commented skeleton of a CRD, filled from the selected
 // row where it can be.
 func (m *Model) starterKube(k kind) string {
-	ns, image, class := "ate-workers", "", "gvisor"
+	ns, image, class := m.info.Namespace, "", "gvisor"
+	if ns == "" {
+		ns = metav1.NamespaceDefault
+	}
 	if r := m.selected(); r != nil {
 		switch o := r.obj.(type) {
 		case *infrav1.WorkerPool:

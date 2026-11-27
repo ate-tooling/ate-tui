@@ -132,7 +132,7 @@ func writeManifest(msg editMsg, content string) tea.Cmd {
 		msg.original = content
 	}
 	return func() tea.Msg {
-		path, err := writeTemp(content)
+		path, err := writeTemp(msg.key.kind, content)
 		if err != nil {
 			return manifestMsg{editMsg: editMsg{act: msg.act}, err: err}
 		}
@@ -141,10 +141,11 @@ func writeManifest(msg editMsg, content string) tea.Cmd {
 	}
 }
 
-// writeTemp saves content in a new temp file, and removes the file again
-// if any step fails, so no partial manifest stays behind.
-func writeTemp(content string) (string, error) {
-	f, err := os.CreateTemp("", "ate-tui-*.yaml")
+// writeTemp saves a manifest of kind k in a new temp file, named after k
+// for the editor's title, and removes the file again if any step fails, so
+// no partial manifest stays behind.
+func writeTemp(k kind, content string) (string, error) {
+	f, err := os.CreateTemp("", string(k)+"-*.yaml")
 	if err != nil {
 		return "", err
 	}
@@ -301,7 +302,7 @@ func (m *Model) manifestFailed(bt *actionBatch, err error) tea.Cmd {
 	m.setStatus(summary, true)
 	text := errorComment(errString(err)) + retry.original
 	return func() tea.Msg {
-		path, werr := writeTemp(text)
+		path, werr := writeTemp(retry.key.kind, text)
 		if werr != nil {
 			return manifestMsg{editMsg: editMsg{act: retry.act}, note: summary + "; your manifest could not be kept: " + werr.Error()}
 		}

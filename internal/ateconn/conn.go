@@ -67,6 +67,9 @@ type Options struct {
 	Endpoint string
 	// TokenFile is a bearer token for ateapi. Empty mints an ate-client token.
 	TokenFile string
+	// ClientName names this client to the cluster: the field manager of
+	// its writes and the requester of its router certificates.
+	ClientName string
 }
 
 // Conn holds the ateapi client and the Kubernetes clients used next to it.
@@ -77,7 +80,10 @@ type Conn struct {
 	Context  string
 	Host     string
 	Endpoint string
+	// Namespace is the context's namespace, "default" when it sets none.
+	Namespace string
 
+	clientName  string
 	config      *rest.Config
 	grpcConn    *grpc.ClientConn
 	stopForward func()
@@ -135,6 +141,10 @@ func Connect(ctx context.Context, opts Options) (*Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load kubeconfig: %w", err)
 	}
+	ns, _, err := cc.Namespace()
+	if err != nil {
+		return nil, fmt.Errorf("load kubeconfig: %w", err)
+	}
 	// Older clusters serve only the deprecated beta ClusterTrustBundle API.
 	config.WarningHandlerWithContext = &rest.NoWarnings{}
 
@@ -147,7 +157,8 @@ func Connect(ctx context.Context, opts Options) (*Conn, error) {
 		return nil, fmt.Errorf("create ate.dev client: %w", err)
 	}
 
-	conn := &Conn{Kube: kc, Ate: ac, Host: config.Host, Context: opts.Context, config: config}
+	conn := &Conn{Kube: kc, Ate: ac, Host: config.Host, Context: opts.Context, Namespace: ns,
+		clientName: opts.ClientName, config: config}
 	if conn.Context == "" {
 		conn.Context = raw.CurrentContext
 	}
