@@ -203,10 +203,10 @@ var kinds = []*kindDef{
 				snap := t.GetStatus().GetSnapshot()
 				rows = append(rows, newRow(md.GetAtespace()+"/"+md.GetName(), t, lvNormal, []string{
 					md.GetAtespace(), md.GetName(),
-					enumTitle(t.GetScope().String(), "TAG_SCOPE_"),
+					explain.TagScope(t.GetScope()),
 					dash(t.GetSourceActor().GetName()),
 					fmt.Sprint(snap.GetGeneration()),
-					enumTitle(snap.GetFidelity().String(), "SNAPSHOT_FIDELITY_"),
+					explain.SnapshotFidelity(snap.GetFidelity()),
 					age(md.GetCreateTime().AsTime(), now),
 					md.GetUid(),
 				}, map[int]string{6: sortTime(md.GetCreateTime().AsTime())}))
@@ -472,14 +472,6 @@ func dash(s string) string {
 		return "-"
 	}
 	return s
-}
-
-func enumTitle(s, prefix string) string {
-	s = strings.TrimPrefix(s, prefix)
-	if s == "" || s == "UNSPECIFIED" {
-		return "-"
-	}
-	return s[:1] + strings.ToLower(s[1:])
 }
 
 // ValidKind reports whether name is a kind or one of its aliases.

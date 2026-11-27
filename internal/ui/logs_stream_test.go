@@ -32,8 +32,11 @@ func TestLogsOverlongLineDoesNotEndStream(t *testing.T) {
 		!strings.HasSuffix(cut.msg, fmt.Sprintf("(truncated: the line is %d bytes)", len(huge))) {
 		t.Fatalf("truncated entry kind %v msg …%q", cut.kind, cut.msg[max(len(cut.msg)-60, 0):])
 	}
-	if !cut.stamp.Equal(t0.Add(time.Second)) {
-		t.Fatalf("truncated entry stamp %v", cut.stamp)
+	if ts := t0.Add(time.Second).Local().Format("15:04:05"); !strings.Contains(ansi.Strip(cut.head), ts) {
+		t.Fatalf("truncated entry head %q, want its kubelet time %s", ansi.Strip(cut.head), ts)
+	}
+	if !m.logs.cursor.Equal(t0.Add(2 * time.Second)) {
+		t.Fatalf("cursor %v, want the last line's stamp", m.logs.cursor)
 	}
 }
 

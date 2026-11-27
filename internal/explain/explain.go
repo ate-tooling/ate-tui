@@ -213,8 +213,8 @@ func checkSnapshots(r *Report, st *ateapi.ActorStatus) {
 			durable = true
 		}
 		lines = append(lines, fmt.Sprintf("gen %d  %s  durable=%s  locality=%s",
-			s.GetGeneration(), trimEnum(s.GetFidelity().String(), "SNAPSHOT_FIDELITY_"),
-			trimEnum(ds.String(), "SNAPSHOT_STORAGE_STATE_"), orDash(s.GetLocality())))
+			s.GetGeneration(), SnapshotFidelity(s.GetFidelity()),
+			title(trimEnum(ds.String(), "SNAPSHOT_STORAGE_STATE_")), orDash(s.GetLocality())))
 	}
 	r.add(Info, fmt.Sprintf("%d snapshot generation(s)", len(snaps)), lines...)
 	if !durable && st.GetAssignedNode() != "" {

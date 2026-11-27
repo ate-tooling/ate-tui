@@ -20,6 +20,9 @@ type ConnInfo struct {
 	Context  string
 	Cluster  string
 	Endpoint string
+	// Namespace is the context's namespace, where new objects go unless
+	// the selected row says otherwise; empty is "default".
+	Namespace string
 }
 
 // Options configures the UI.
@@ -30,8 +33,10 @@ type Options struct {
 	// Contexts lists the kubeconfig contexts for :ctx; nil disables it.
 	Contexts func() ([]KubeContext, error)
 	// Context is the kube context to start on; empty is the current one.
-	Context   string
-	Refresh   time.Duration
+	Context string
+	Refresh time.Duration
+	// Name is the program's, shown with Version in the header.
+	Name      string
 	Version   string
 	Kind      string
 	Atespace  string

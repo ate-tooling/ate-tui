@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ate-tooling/ate-tui/internal/explain"
 	ateapi "go.ate.dev/substrate/api/ateapi/v1"
 )
 
@@ -41,7 +42,7 @@ func (b *Backend) DialActor(_ context.Context, ref *ateapi.ObjectRef, port int) 
 		}
 	default:
 		return nil, fmt.Errorf("router rejected CONNECT to %s:%d with 503 Service Unavailable: actor is %s",
-			ref.GetName(), port, stateName(a.Status.State))
+			ref.GetName(), port, explain.ActorState(a.Status.State))
 	}
 	client, server := net.Pipe()
 	go b.serveHTTP(server, a, port)
@@ -62,7 +63,7 @@ func (b *Backend) serveHTTP(c net.Conn, a *ateapi.Actor, port int) {
 
 		b.mu.Lock()
 		id := a.Metadata.Atespace + "/" + a.Metadata.Name
-		state := stateName(a.Status.State)
+		state := explain.ActorState(a.Status.State)
 		if pod := a.Status.GetWorkerAssignment().GetWorkerPod(); pod != "" {
 			b.emit(pod, a, "agent", fmt.Sprintf("%s %s from atenet-router", req.Method, req.URL.RequestURI()))
 		}

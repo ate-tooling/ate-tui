@@ -163,14 +163,14 @@ func (m *Model) viewHeader() []string {
 			}
 		}
 	}
-	out := box(stBrand.Render("ate-tui"), lines, w, 5, stHeaderBorder)
+	out := box(stBrand.Render(m.opts.Name), lines, w, 5, stHeaderBorder)
 	if showLogo {
 		for i := range out {
 			l := ""
 			if i < len(logo) {
 				l = colorLogo(logo[i])
 			} else if i == len(logo) {
-				l = stVersion.Render(fmt.Sprintf("%*s", logoWidth-1, "ate-tui "+m.opts.Version))
+				l = stVersion.Render(fmt.Sprintf("%*s", logoWidth-1, m.opts.Name+" "+m.opts.Version))
 			}
 			out[i] += fit(l, logoWidth)
 		}

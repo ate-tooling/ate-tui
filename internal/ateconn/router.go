@@ -44,8 +44,6 @@ const (
 	// routerCertRefreshTimeout bounds a refresh made while a cached
 	// certificate is still valid.
 	routerCertRefreshTimeout = 15 * time.Second
-	// routerCertRequester names this client on its PodCertificateRequests.
-	routerCertRequester = "ate-tui"
 	// routerClientSA is the ServiceAccount the client certificate is for.
 	// The router allows its SPIFFE ID by default.
 	routerClientSA = "atenet-client"
@@ -81,7 +79,7 @@ func (c *Conn) router(ctx context.Context) (*routerDialer, error) {
 	if err != nil {
 		return nil, err
 	}
-	certs := &routerClientCerts{kube: c.Kube}
+	certs := &routerClientCerts{kube: c.Kube, requester: c.clientName}
 	if _, err := certs.get(ctx); err != nil {
 		return nil, err
 	}
@@ -107,23 +105,24 @@ func (c *Conn) DialActor(ctx context.Context, ref *ateapi.ObjectRef, port int) (
 	if err != nil {
 		return nil, err
 	}
+	actor := ref.GetAtespace() + "/" + ref.GetName()
+	return connectActor(ctx, localPort, stop, d.tlsConfig, ref.GetName(), port, http.Header{targetActorHeader: []string{actor}})
+}
+
+// connectActor opens the tunnel through the port-forward on localPort, and
+// takes over stop: the returned conn calls it when closed, and a failure
+// calls it before returning.
+func connectActor(ctx context.Context, localPort int, stop func(), tlsCfg *tls.Config, name string, port int, header http.Header) (_ *forwardedConn, err error) {
+	defer func() {
+		if err != nil {
+			stop()
+		}
+	}()
 	var dialer net.Dialer
 	raw, err := dialer.DialContext(ctx, "tcp", fmt.Sprintf("127.0.0.1:%d", localPort))
 	if err != nil {
-		stop()
 		return nil, fmt.Errorf("connecting to router's CONNECT listener: %w", err)
 	}
-	actor := ref.GetAtespace() + "/" + ref.GetName()
-	fc, err := connectActor(ctx, raw, d.tlsConfig, ref.GetName(), port, http.Header{targetActorHeader: []string{actor}})
-	if err != nil {
-		stop()
-		return nil, err
-	}
-	fc.stop = stop
-	return fc, nil
-}
-
-func connectActor(ctx context.Context, raw net.Conn, tlsCfg *tls.Config, name string, port int, header http.Header) (*forwardedConn, error) {
 	tlsConn := tls.Client(raw, tlsCfg.Clone())
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		_ = raw.Close()
@@ -159,7 +158,7 @@ func connectActor(ctx context.Context, raw net.Conn, tlsCfg *tls.Config, name st
 		_ = tlsConn.Close()
 		return nil, ctx.Err()
 	}
-	return &forwardedConn{Conn: tlsConn, reader: reader}, nil
+	return &forwardedConn{Conn: tlsConn, reader: reader, stop: stop}, nil
 }
 
 // forwardedConn keeps the bytes http.ReadResponse buffered past the header
@@ -182,16 +181,15 @@ func (c *forwardedConn) CloseWrite() error {
 
 func (c *forwardedConn) Close() error {
 	err := c.Conn.Close()
-	if c.stop != nil {
-		c.stopOnce.Do(c.stop)
-	}
+	c.stopOnce.Do(c.stop)
 	return err
 }
 
 // routerClientCerts holds the current router client certificate and
 // requests a new one once half its lifetime has passed.
 type routerClientCerts struct {
-	kube kubernetes.Interface
+	kube      kubernetes.Interface
+	requester string // names this client on its PodCertificateRequests
 
 	mu        sync.Mutex
 	cert      *tls.Certificate
@@ -210,7 +208,7 @@ func (c *routerClientCerts) get(ctx context.Context) (*tls.Certificate, error) {
 		timeout = routerCertRefreshTimeout
 	}
 	ns := SystemNamespace()
-	cert, err := requestCertificate(ctx, c.kube, routerCertRequester, ns, routerClientSA, timeout)
+	cert, err := requestCertificate(ctx, c.kube, c.requester, ns, routerClientSA, timeout)
 	if err != nil {
 		now = time.Now()
 		// kubectl-ate warns on stderr here; a TUI cannot, so it keeps the

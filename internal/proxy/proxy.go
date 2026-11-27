@@ -84,17 +84,17 @@ type DialFunc func(ctx context.Context, port int) (net.Conn, error)
 // Forward is one listening local port. It runs until Stop or until its
 // listener fails.
 type Forward struct {
-	Actor   string
-	Local   string // the bound address, host:port
-	Remote  int
-	Started time.Time
+	Actor  string
+	Local  string // the bound address, host:port
+	Remote int
 
-	lis    net.Listener
-	dial   DialFunc
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
-	done   chan struct{}
+	started time.Time
+	lis     net.Listener
+	dial    DialFunc
+	ctx     context.Context
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup
+	done    chan struct{}
 
 	active, total, failed atomic.Int64
 	in, out               atomic.Int64
@@ -107,6 +107,7 @@ type Forward struct {
 
 // Stats is a snapshot of a forward's counters.
 type Stats struct {
+	Started               time.Time
 	Active, Total, Failed int64
 	// In counts bytes from the local client to the actor, Out the reverse.
 	In, Out int64
@@ -126,7 +127,7 @@ func Start(actor, addr string, m Mapping, dial DialFunc) (*Forward, error) {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	f := &Forward{Actor: actor, Local: lis.Addr().String(), Remote: m.Remote, Started: time.Now(),
+	f := &Forward{Actor: actor, Local: lis.Addr().String(), Remote: m.Remote, started: time.Now(),
 		lis: lis, dial: dial, ctx: ctx, cancel: cancel, done: make(chan struct{})}
 	go f.serve()
 	return f, nil
@@ -240,7 +241,7 @@ func (f *Forward) Done() <-chan struct{} { return f.done }
 func (f *Forward) Stats() Stats {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	s := Stats{Active: f.active.Load(), Total: f.total.Load(), Failed: f.failed.Load(),
+	s := Stats{Started: f.started, Active: f.active.Load(), Total: f.total.Load(), Failed: f.failed.Load(),
 		In: f.in.Load(), Out: f.out.Load(), LastErr: f.lastErr, ErrAt: f.errAt, Err: f.stopErr}
 	select {
 	case <-f.done:

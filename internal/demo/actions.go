@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/ate-tooling/ate-tui/internal/explain"
 	ateapi "go.ate.dev/substrate/api/ateapi/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -35,8 +36,6 @@ func (b *Backend) worker(name string) (*ateapi.Worker, error) {
 	return nil, status.Errorf(codes.NotFound, "worker %s not found", name)
 }
 
-func stateName(s ateapi.ActorState) string { return s.String()[len("ACTOR_STATE_"):] }
-
 // begin moves a to an in-progress state that completes after settle polls.
 func (b *Backend) begin(a *ateapi.Actor, s ateapi.ActorState) {
 	if a == b.migrant {
@@ -61,7 +60,7 @@ func (b *Backend) result(a *ateapi.Actor) (*ateapi.Actor, error) {
 func (b *Backend) busy(a *ateapi.Actor) error {
 	if _, ok := b.pending[a]; ok || a.Status.State == ateapi.ActorState_ACTOR_STATE_DELETING {
 		return status.Errorf(codes.Aborted, "actor %s/%s is %s; retry when the transition completes",
-			a.Metadata.Atespace, a.Metadata.Name, stateName(a.Status.State))
+			a.Metadata.Atespace, a.Metadata.Name, explain.ActorState(a.Status.State))
 	}
 	return nil
 }
@@ -95,7 +94,7 @@ func (b *Backend) SuspendActor(_ context.Context, ref *ateapi.ObjectRef, mode at
 		}
 	default:
 		return nil, status.Errorf(codes.FailedPrecondition, "actor %s/%s is %s; only a RUNNING actor can be suspended",
-			ref.GetAtespace(), ref.GetName(), stateName(a.Status.State))
+			ref.GetAtespace(), ref.GetName(), explain.ActorState(a.Status.State))
 	}
 	return b.result(a)
 }
@@ -120,7 +119,7 @@ func (b *Backend) ResumeActor(_ context.Context, ref *ateapi.ObjectRef) (*ateapi
 		return nil, status.Errorf(codes.FailedPrecondition, "actor %s/%s is CRASHED; revert it to its durable snapshot before resuming",
 			ref.GetAtespace(), ref.GetName())
 	default:
-		return nil, status.Errorf(codes.FailedPrecondition, "actor %s/%s is %s", ref.GetAtespace(), ref.GetName(), stateName(a.Status.State))
+		return nil, status.Errorf(codes.FailedPrecondition, "actor %s/%s is %s", ref.GetAtespace(), ref.GetName(), explain.ActorState(a.Status.State))
 	}
 	return b.result(a)
 }
@@ -148,7 +147,7 @@ func (b *Backend) RevertActor(_ context.Context, ref *ateapi.ObjectRef) (*ateapi
 		return nil, status.Errorf(codes.FailedPrecondition, "actor %s/%s is SUSPENDED without a node-local snapshot; it is already at its durable snapshot",
 			ref.GetAtespace(), ref.GetName())
 	default:
-		return nil, status.Errorf(codes.FailedPrecondition, "actor %s/%s is %s", ref.GetAtespace(), ref.GetName(), stateName(a.Status.State))
+		return nil, status.Errorf(codes.FailedPrecondition, "actor %s/%s is %s", ref.GetAtespace(), ref.GetName(), explain.ActorState(a.Status.State))
 	}
 	return b.result(a)
 }

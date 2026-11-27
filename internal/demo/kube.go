@@ -101,10 +101,12 @@ func (b *Backend) bump(md *metav1.ObjectMeta) {
 	md.Generation++
 }
 
-func (b *Backend) event(kind, namespace, name, reason, msg string) {
+// poolEvent records the event the controller emits when it acts on a
+// WorkerPool, the only kind whose events the demo makes up.
+func (b *Backend) poolEvent(namespace, name, reason, msg string) {
 	t := metav1.Now()
 	b.kubeEvents = append(b.kubeEvents, corev1.Event{
-		InvolvedObject: corev1.ObjectReference{Kind: kind, Namespace: namespace, Name: name},
+		InvolvedObject: corev1.ObjectReference{Kind: "WorkerPool", Namespace: namespace, Name: name},
 		Type:           corev1.EventTypeNormal, Reason: reason, Message: msg, Count: 1, FirstTimestamp: t, LastTimestamp: t,
 	})
 }
@@ -362,7 +364,7 @@ func (b *Backend) CreateObject(_ context.Context, obj metav1.Object) (metav1.Obj
 		b.resolve(p)
 		b.pools = append(b.pools, *p)
 		b.rolling[p.Name] = true
-		b.event("WorkerPool", p.Namespace, p.Name, "Created", fmt.Sprintf("Created worker Deployment with %d replicas", p.Spec.Replicas))
+		b.poolEvent(p.Namespace, p.Name, "Created", fmt.Sprintf("Created worker Deployment with %d replicas", p.Spec.Replicas))
 		return p.DeepCopy(), nil
 	case *infrav1.SandboxConfig:
 		c := o.DeepCopy()
@@ -431,7 +433,7 @@ func (b *Backend) UpdateObject(_ context.Context, obj metav1.Object) (metav1.Obj
 		*p = *in
 		b.resolve(p)
 		b.rolling[p.Name] = true
-		b.event("WorkerPool", p.Namespace, p.Name, "Updated", "Applied the worker Deployment")
+		b.poolEvent(p.Namespace, p.Name, "Updated", "Applied the worker Deployment")
 		return p.DeepCopy(), nil
 	case *infrav1.SandboxConfig:
 		c := b.sandbox(o.Name)
@@ -555,7 +557,7 @@ func (b *Backend) ScaleWorkerPool(_ context.Context, namespace, name string, rep
 	if replicas < 0 {
 		return nil, invalid("WorkerPool", name, field.ErrorList{field.Invalid(field.NewPath("spec", "replicas"), replicas, "must be greater than or equal to 0")})
 	}
-	b.event("WorkerPool", namespace, name, "Scaled", fmt.Sprintf("Scaled worker Deployment from %d to %d", p.Spec.Replicas, replicas))
+	b.poolEvent(namespace, name, "Scaled", fmt.Sprintf("Scaled worker Deployment from %d to %d", p.Spec.Replicas, replicas))
 	p.Spec.Replicas = replicas
 	b.bump(&p.ObjectMeta)
 	b.rolling[p.Name] = true

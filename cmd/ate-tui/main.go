@@ -20,6 +20,10 @@ import (
 
 var version = "dev"
 
+// name is the program's: in its header and messages, its config and state
+// directories, and its writes and certificate requests to the cluster.
+const name = "ate-tui"
+
 func main() {
 	var (
 		opts     ateconn.Options
@@ -31,6 +35,8 @@ func main() {
 		write    bool
 		showVer  bool
 	)
+	opts.ClientName = name
+	dirs := config.For(name)
 	flag.StringVar(&opts.Kubeconfig, "kubeconfig", "", "path to the kubeconfig file")
 	flag.StringVar(&opts.Context, "context", "", "kubeconfig context to start on (:ctx switches later)")
 	flag.StringVar(&opts.Endpoint, "endpoint", "", "ateapi gRPC endpoint for the starting context; if omitted, port-forwards to the api Service")
@@ -43,7 +49,7 @@ func main() {
 	flag.BoolVar(&write, "write", false, "allow actions (suspend, resume, revert, delete, drain, mark) and proxies on every context; each still asks to confirm")
 	flag.BoolVar(&showVer, "version", false, "print the version and exit")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: ate-tui [flags] [kind]\n\nkinds: actors, workers, templates, workerpools, atespaces, tags\nconfig: %s\n\n", config.Path())
+		fmt.Fprintf(os.Stderr, "usage: %s [flags] [kind]\n\nkinds: actors, workers, templates, workerpools, atespaces, tags\nconfig: %s\n\n", name, dirs.Path())
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -54,14 +60,14 @@ func main() {
 	set := map[string]bool{}
 	flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
 
-	cfgPath := config.Path()
+	cfgPath := dirs.Path()
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		fail("config: %v", err)
 	}
 	if !set["refresh"] {
-		if d, _ := cfg.RefreshInterval(); d > 0 {
-			refresh = d
+		if cfg.Refresh > 0 {
+			refresh = cfg.Refresh
 		}
 	} else if refresh < config.MinRefresh {
 		fail("--refresh: %s is below the %s minimum", refresh, config.MinRefresh)
@@ -72,7 +78,7 @@ func main() {
 	if !set["skin"] {
 		skinName = cfg.Skin
 	}
-	palette, err := skin.Resolve(skinName, config.SkinDir(), cfg.Colors)
+	palette, err := skin.Resolve(skinName, dirs.SkinDir(), cfg.Colors)
 	if err != nil {
 		fail("config: %v", err)
 	}
@@ -115,7 +121,7 @@ func main() {
 		if err != nil {
 			return nil, ui.ConnInfo{}, err
 		}
-		return c, ui.ConnInfo{Context: c.Context, Cluster: c.Host, Endpoint: c.Endpoint}, nil
+		return c, ui.ConnInfo{Context: c.Context, Cluster: c.Host, Endpoint: c.Endpoint, Namespace: c.Namespace}, nil
 	}
 	contexts := func() ([]ui.KubeContext, error) {
 		cs, err := ateconn.Contexts(opts.Kubeconfig)
@@ -128,9 +134,10 @@ func main() {
 		}
 		return out, nil
 	}
+	writeContexts := cfg.WriteContexts
 	if demoMode {
 		label = "demo"
-		cfg.WriteContexts = nil // the demo writes only with --write
+		writeContexts = nil // the demo writes only with --write
 		demoContexts := []ui.KubeContext{
 			{Name: "demo", Cluster: "https://substrate.demo:6443", Current: true},
 			{Name: "demo-staging", Cluster: "https://staging.substrate.demo:6443"},
@@ -158,6 +165,7 @@ func main() {
 		Contexts:  contexts,
 		Context:   opts.Context,
 		Refresh:   refresh,
+		Name:      name,
 		Version:   version,
 		Kind:      kind,
 		Atespace:  atespace,
@@ -165,16 +173,16 @@ func main() {
 		ConnLabel: label,
 
 		Write:         write,
-		WriteContexts: cfg.WriteContexts,
+		WriteContexts: writeContexts,
 		ConfigPath:    cfgPath,
-		JournalPath:   config.JournalPath(),
+		JournalPath:   dirs.JournalPath(),
 
 		Keys:         keys,
 		ProxyAddress: cfg.ProxyAddress,
 		Copy:         out.Copy,
 	})
 	popts := []tea.ProgramOption{tea.WithAltScreen(), tea.WithOutput(out)}
-	if cfg.MouseEnabled() {
+	if cfg.Mouse {
 		popts = append(popts, tea.WithMouseCellMotion())
 	}
 	_, err = tea.NewProgram(m, popts...).Run()
@@ -185,6 +193,6 @@ func main() {
 }
 
 func fail(format string, a ...any) {
-	fmt.Fprintf(os.Stderr, "ate-tui: "+format+"\n", a...)
+	fmt.Fprintf(os.Stderr, name+": "+format+"\n", a...)
 	os.Exit(1)
 }
