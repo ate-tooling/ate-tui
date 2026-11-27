@@ -142,15 +142,32 @@ func decodeKube(k kind, data []byte) (metav1.Object, error) {
 	return obj, nil
 }
 
-// parseKube reads a create manifest. The fields the server sets are
-// cleared, so the output of kubectl get -o yaml works as a start.
+// parseKube reads a create manifest. The fields the server and kubectl
+// set are cleared, as for a copy, so the output of kubectl get -o yaml
+// works as a start.
 func parseKube(k kind, data []byte) (any, string, error) {
 	obj, err := decodeKube(k, data)
 	if err != nil {
 		return nil, "", err
 	}
-	clearServerFields(obj)
+	clearCreateFields(obj)
 	return obj, objID(obj), nil
+}
+
+// clearCreateFields drops what a new object must not inherit from the one
+// its manifest came from: the server-set fields, finalizers (a controller
+// adds its own) and kubectl's last-applied-configuration. A copy (ctrl-n)
+// also loses the class-default annotation, which cloneKube removes; a
+// typed create keeps it, as the starter SandboxConfig offers it.
+func clearCreateFields(o metav1.Object) {
+	clearServerFields(o)
+	o.SetFinalizers(nil)
+	ann := o.GetAnnotations()
+	delete(ann, "kubectl.kubernetes.io/last-applied-configuration")
+	if len(ann) == 0 {
+		ann = nil
+	}
+	o.SetAnnotations(ann)
 }
 
 func clearServerFields(o metav1.Object) {
@@ -219,13 +236,11 @@ func cloneKube(o metav1.Object) (string, error) {
 	if c == nil {
 		return "", fmt.Errorf("cannot clone %T", o)
 	}
-	clearServerFields(c)
+	clearCreateFields(c)
 	c.SetName(c.GetName() + "-copy")
-	c.SetFinalizers(nil)
 	ann := c.GetAnnotations()
 	// A copy must not take over as its class's default SandboxConfig.
 	delete(ann, infrav1.SandboxConfigClassDefaultAnnotation)
-	delete(ann, "kubectl.kubernetes.io/last-applied-configuration")
 	if len(ann) == 0 {
 		ann = nil
 	}

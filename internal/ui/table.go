@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/charmbracelet/x/ansi"
-	"github.com/mattn/go-runewidth"
 )
 
 type row struct {
@@ -21,6 +20,9 @@ type row struct {
 }
 
 func newRow(id string, obj any, lv rowLevel, cells []string, sortBy map[int]string) row {
+	for i, c := range cells {
+		cells[i] = printable(c, toPlain)
+	}
 	return row{id: id, obj: obj, level: lv, cells: cells, sortBy: sortBy, search: strings.ToLower(strings.Join(cells, " "))}
 }
 
@@ -54,7 +56,11 @@ type tableState struct {
 	sortCol  int
 	sortDesc bool
 	marked   map[string]bool
-	widths   []int
+	// marksGone is set when a refresh dropped the last marks because their
+	// rows went away, so the next action refuses instead of falling back
+	// to the cursor row.
+	marksGone bool
+	widths    []int
 }
 
 // filterTerms are space-separated AND terms; a leading ! negates one.
@@ -97,12 +103,12 @@ func (ts *tableState) rebuild(rows []row, columns []string, keepID string) {
 	ts.widths = make([]int, len(columns))
 	for i, c := range columns {
 		// +1 leaves room for the sort arrow.
-		ts.widths[i] = runewidth.StringWidth(c) + 1
+		ts.widths[i] = ansi.StringWidth(c) + 1
 	}
 	for _, vi := range ts.visible {
 		for i, c := range rows[vi].cells {
 			if i < len(ts.widths) {
-				if w := runewidth.StringWidth(c); w > ts.widths[i] {
+				if w := ansi.StringWidth(c); w > ts.widths[i] {
 					ts.widths[i] = w
 				}
 			}
@@ -209,12 +215,14 @@ func renderCells(cells []string, widths []int, gutter string) string {
 		if i < len(cells) {
 			c = cells[i]
 		}
-		if runewidth.StringWidth(c) > wd {
+		cw := ansi.StringWidth(c)
+		if cw > wd {
 			c = ansi.Truncate(c, wd, "…")
+			cw = ansi.StringWidth(c)
 		}
 		b.WriteString(strings.Repeat(" ", pad))
 		b.WriteString(c)
-		pad = wd - runewidth.StringWidth(c) + colGap
+		pad = wd - cw + colGap
 	}
 	return b.String()
 }

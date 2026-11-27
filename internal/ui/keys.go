@@ -90,7 +90,17 @@ func (m *Model) keyTable(key string) tea.Cmd {
 		return move(-h)
 	case "w":
 		m.wide = !m.wide
-		t.sortCol = min(t.sortCol, len(m.columns(m.cur.kind))-1)
+		// Every table may sort by a column that just went away.
+		for k, ts := range m.tables {
+			if n := len(m.columns(k.kind)); ts.sortCol >= n {
+				ts.sortCol = max(n-1, 0)
+				if k != m.cur {
+					if d := m.data[k]; d != nil {
+						ts.rebuild(d.rows, m.columns(k.kind), idOf(m.selectedIn(k)))
+					}
+				}
+			}
+		}
 		m.rebuild()
 		if m.wide {
 			m.setStatus("Wide: every column", false)
@@ -554,6 +564,9 @@ func (m *Model) keyPager(msg tea.KeyMsg) tea.Cmd {
 	p := m.pager
 	// c copies the pager's text; in logs, where c picks the source, C does.
 	if key := msg.String(); (key == "c" && m.logs == nil) || (key == "C" && m.logs != nil && !m.logs.searching) {
+		if m.logs != nil {
+			return m.copy(m.logs.copyText())
+		}
 		return m.copy(pagerText(p.lines))
 	}
 	if m.logs != nil && m.keyLogs(msg) {
@@ -610,4 +623,11 @@ func (m *Model) keyPager(msg tea.KeyMsg) tea.Cmd {
 		m.openHelp()
 	}
 	return nil
+}
+
+func idOf(r *row) string {
+	if r == nil {
+		return ""
+	}
+	return r.id
 }

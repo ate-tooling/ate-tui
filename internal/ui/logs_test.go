@@ -39,7 +39,7 @@ func (b *logBackend) PodLogs(ctx context.Context, _, pod string, opts *corev1.Po
 	defer b.mu.Unlock()
 	b.calls = append(b.calls, logCall{pod, opts, ctx})
 	content := strings.Join(b.lines[pod], "\n") + "\n"
-	if !b.open[pod] {
+	if !b.open[pod] || !opts.Follow {
 		return io.NopCloser(strings.NewReader(content)), nil
 	}
 	pr, pw := io.Pipe()
@@ -134,30 +134,40 @@ func TestLogsFollowMigration(t *testing.T) {
 	b := &logBackend{Backend: demo.New(),
 		lines: map[string][]string{
 			"pod-a": {kubeLine(0, "", "restored"), kubeLine(time.Second, "agent", "a2")},
-			"pod-b": {kubeLine(5*time.Second, "", "restored"), kubeLine(6*time.Second, "agent", "b2")},
+			// The first line is from an earlier stay on pod-b: not shown.
+			"pod-b": {kubeLine(-time.Hour, "agent", "earlier stay"), kubeLine(5*time.Second, "", "restored"), kubeLine(6*time.Second, "agent", "b2")},
 		},
 		open: map[string]bool{"pod-a": true, "pod-b": true},
 	}
 	m := logModel(t, b)
 	running := ateapi.ActorState_ACTOR_STATE_RUNNING
 	cmd := m.openLogs(logActor(running, "pod-a"))
-	pump(t, m, cmd, func() bool { return len(m.logs.entries) == 2 })
+	cmd = pump(t, m, cmd, func() bool { return len(m.logs.entries) == 2 })
 	if c := b.call(0); !c.opts.Timestamps || !c.opts.Follow || c.opts.SinceTime != nil || c.opts.TailLines == nil {
 		t.Fatalf("first connect options %+v", c.opts)
 	}
 
-	// The actor moves: the old stream is cancelled and the new pod streamed
-	// from the cursor.
-	_, cmd = m.Update(logActorMsg{gen: m.logs.gen, actor: logActor(running, "pod-b")})
+	// The actor moves: the old stream is cancelled, and once what it read
+	// is in, the new pod is streamed.
+	if _, c := m.Update(logActorMsg{gen: m.logs.gen, actor: logActor(running, "pod-b")}); c != nil {
+		t.Fatal("new stream opened before the old one ended")
+	}
 	if b.call(0).ctx.Err() == nil {
 		t.Fatal("stream on pod-a still open after the move")
 	}
-	pump(t, m, cmd, func() bool { return len(m.logs.entries) == 5 })
+	cmd = pump(t, m, cmd, func() bool { return len(m.logs.entries) == 5 })
 	want := []string{"restored", "a2", "── moved to ate-workers/pod-b ──", "restored", "b2"}
 	if got := msgs(m); strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Fatalf("entries %q, want %q", got, want)
 	}
-	if c := b.call(1); c.pod != "pod-b" || c.opts.SinceTime == nil || !c.opts.SinceTime.Time.Equal(t0.Add(time.Second)) {
+	// pod-a's cursor is another node's clock: pod-b is read from a minute
+	// before it, not from it, and not its whole tail.
+	// Once the follow stream ended, pod-a was read once more up to now, for
+	// the lines the cancel cut off.
+	if c := b.call(1); c.pod != "pod-a" || c.opts.Follow || c.opts.SinceTime == nil {
+		t.Fatalf("catch-up read %s %+v", c.pod, c.opts)
+	}
+	if c := b.call(2); c.pod != "pod-b" || c.opts.TailLines != nil || c.opts.SinceTime == nil || !c.opts.SinceTime.Time.Equal(t0.Add(time.Second-clockSkew)) {
 		t.Fatalf("second connect %s %+v", c.pod, c.opts)
 	}
 	if !strings.Contains(m.View(), "pod-b") {
@@ -169,7 +179,11 @@ func TestLogsFollowMigration(t *testing.T) {
 		ateapi.ActorState_ACTOR_STATE_SUSPENDED, ateapi.ActorState_ACTOR_STATE_RESUMING} {
 		m.Update(logActorMsg{gen: m.logs.gen, actor: logActor(st, "")})
 	}
-	if b.call(1).ctx.Err() == nil || m.logs.stream != 0 {
+	if b.call(2).ctx.Err() == nil {
+		t.Fatal("stream still open while the actor is not running")
+	}
+	pump(t, m, cmd, func() bool { return m.logs.stream == 0 })
+	if m.logs.stream != 0 {
 		t.Fatal("stream still open while the actor is not running")
 	}
 	got := msgs(m)[5:]
@@ -186,19 +200,20 @@ func TestLogsKeptAfterDelete(t *testing.T) {
 	}, open: map[string]bool{"pod-a": true}}
 	m := logModel(t, b)
 	cmd := m.openLogs(logActor(ateapi.ActorState_ACTOR_STATE_RUNNING, "pod-a"))
-	pump(t, m, cmd, func() bool { return len(m.logs.entries) == 2 })
+	cmd = pump(t, m, cmd, func() bool { return len(m.logs.entries) == 2 })
 	// Deleting stops the stream; then the actor is gone.
 	m.Update(logActorMsg{gen: m.logs.gen, actor: logActor(ateapi.ActorState_ACTOR_STATE_DELETING, "")})
 	b.mu.Lock()
 	b.lines["pod-a"] = append(b.lines["pod-a"], kubeLine(2*time.Second, "", "last words"))
 	b.open["pod-a"] = false
 	b.mu.Unlock()
-	_, cmd = m.Update(logActorMsg{gen: m.logs.gen, err: status.Error(codes.NotFound, "actor not found")})
-	if !m.logs.kept || m.pager == nil {
-		t.Fatal("pager not kept after the delete")
-	}
+	m.Update(logActorMsg{gen: m.logs.gen, err: status.Error(codes.NotFound, "actor not found")})
+	// The cancelled stream ends, then what pod-a kept is read once.
 	for cmd != nil {
 		_, cmd = m.Update(run(t, cmd))
+	}
+	if !m.logs.kept || m.pager == nil {
+		t.Fatal("pager not kept after the delete")
 	}
 	want := []string{"working", "torn down", "waiting: actor is Deleting",
 		"── actor deleted; showing what ate-workers/pod-a kept ──", "last words"}

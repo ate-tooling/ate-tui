@@ -18,10 +18,13 @@ import (
 
 // pager is a scrollable text view over the table area.
 type pager struct {
-	title   string
-	lines   []string
-	offset  int
-	follow  bool
+	title  string
+	lines  []string
+	offset int
+	follow bool
+	// paused is set when scrolling up paused follow, so scrolling back
+	// to the end resumes it; f turning follow off does not set it.
+	paused  bool
 	loading bool
 	gen     int
 	// reload refreshes the content on each tick; nil for static views.
@@ -61,9 +64,14 @@ func (p *pager) scroll(n, h int) {
 	if p.offset < 0 {
 		p.offset = 0
 	}
-	// Scrolling up pauses log follow; reaching the end resumes it.
-	if n < 0 {
-		p.follow = false
+	// Scrolling up pauses log follow; scrolling down to the end resumes it.
+	switch {
+	case p.follow && n >= 0:
+		p.paused = false
+	case n < 0 && p.follow:
+		p.follow, p.paused = false, true
+	case n > 0 && p.paused && p.offset >= len(p.lines)-h:
+		p.follow, p.paused = true, false
 	}
 }
 
@@ -266,13 +274,13 @@ func renderReport(r explain.Report) []string {
 		w = max(w, len(f.Label))
 	}
 	for _, f := range r.Facts {
-		out = append(out, stLabel.Render(fmt.Sprintf("%-*s", w+2, f.Label))+stCount.Render(f.Value))
+		out = append(out, stLabel.Render(fmt.Sprintf("%-*s", w+2, f.Label))+stCount.Render(printable(f.Value, toPlain)))
 	}
 	out = append(out, "", stSection.Render("Diagnosis"))
 	for _, f := range r.Findings {
-		out = append(out, levelGlyph[f.Level]+" "+levelStyle[f.Level](f.Title))
+		out = append(out, levelGlyph[f.Level]+" "+levelStyle[f.Level](printable(f.Title, toPlain)))
 		for _, d := range f.Detail {
-			out = append(out, "    "+stDim.Render(d))
+			out = append(out, "    "+stDim.Render(printable(d, toPlain)))
 		}
 	}
 	if len(r.Next) > 0 {

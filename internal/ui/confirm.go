@@ -68,6 +68,12 @@ func (m *Model) viewConfirm(maxH int) []string {
 			tail = append(tail, stDim.Render("returns once the snapshot is on the node; upload continues"))
 		}
 	}
+	for _, wn := range c.warnings {
+		tail = append(tail, "")
+		for _, l := range strings.Split(ansi.Wrap("⚠ "+wn, inner, ""), "\n") {
+			tail = append(tail, stStatusErr.Render(l))
+		}
+	}
 	keys := "y/⏎ confirm  ·  n/esc cancel"
 	if a.prompt != "" {
 		tail = append(tail, "", stCount.Render(a.prompt+": ")+stInputPrompt.Render("> ")+stInput.Render(m.input)+stInput.Render("█"))

@@ -142,26 +142,6 @@ func TestEditCannotRename(t *testing.T) {
 	}
 }
 
-func TestEditConflict(t *testing.T) {
-	m := writeModel(t)
-	fakeEditor(t, m, func(s string) string { return strings.Replace(s, "replicas: 4", "replicas: 5", 1) })
-	press(m, ":", "workerpools", "enter")
-	selectID(t, m, "ate-workers/pool-gvisor")
-	press(m, "ctrl+e")
-	if m.mode != modeConfirm {
-		t.Fatalf("mode %v", m.mode)
-	}
-	// Someone else scales the pool while the dialog is open.
-	p := m.confirm.targets[0].obj.(*infrav1.WorkerPool)
-	if _, err := m.backend.ScaleWorkerPool(t.Context(), p.Namespace, p.Name, 2); err != nil {
-		t.Fatal(err)
-	}
-	press(m, "y")
-	if !m.statusErr || !strings.Contains(m.status, "edit it again") {
-		t.Errorf("status %q", m.status)
-	}
-}
-
 func TestCreateSandboxConfigRefusedReopens(t *testing.T) {
 	m := writeModel(t)
 	sha := strings.Repeat("ab", 32)

@@ -5,10 +5,15 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	ateapi "go.ate.dev/substrate/api/ateapi/v1"
+	infrav1 "go.ate.dev/substrate/api/infra/k8s/ate/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -56,6 +61,9 @@ type (
 		original string // the manifest as offered, to spot "no changes"
 		// orig is the object an edit started from.
 		orig any
+		// retried is set once the server failed this manifest: original is
+		// then the user's text, which a cancel keeps on disk.
+		retried bool
 	}
 	editedMsg struct {
 		editMsg
@@ -69,7 +77,12 @@ type (
 		text      string   // the manifest as saved, to edit again if the server refuses it
 		diff      []string // what an edit changes
 		cancelled bool
-		err       error
+		emptied   bool // the user emptied the file to cancel
+		// kept is where a manifest the server failed was saved; note is
+		// the status to show with it.
+		kept string
+		note string
+		err  error
 	}
 )
 
@@ -119,17 +132,31 @@ func writeManifest(msg editMsg, content string) tea.Cmd {
 		msg.original = content
 	}
 	return func() tea.Msg {
-		f, err := os.CreateTemp("", "ate-tui-*.yaml")
+		path, err := writeTemp(content)
 		if err != nil {
 			return manifestMsg{editMsg: editMsg{act: msg.act}, err: err}
 		}
-		defer f.Close()
-		if _, err := f.WriteString(content); err != nil {
-			return manifestMsg{editMsg: editMsg{act: msg.act}, err: err}
-		}
-		msg.path = f.Name()
+		msg.path = path
 		return msg
 	}
+}
+
+// writeTemp saves content in a new temp file, and removes the file again
+// if any step fails, so no partial manifest stays behind.
+func writeTemp(content string) (string, error) {
+	f, err := os.CreateTemp("", "ate-tui-*.yaml")
+	if err != nil {
+		return "", err
+	}
+	_, err = f.WriteString(content)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(f.Name())
+		return "", err
+	}
+	return f.Name(), nil
 }
 
 // editor is $VISUAL, then $EDITOR, then vi, split into words so
@@ -170,7 +197,11 @@ func (m *Model) edited(msg editedMsg) tea.Cmd {
 			return out
 		}
 		text := stripErrors(string(b))
-		if text == stripErrors(msg.original) || strings.TrimSpace(uncomment(text)) == "" {
+		if strings.TrimSpace(uncomment(text)) == "" {
+			out.cancelled, out.emptied = true, true
+			return out
+		}
+		if text == stripErrors(msg.original) {
 			out.cancelled = true
 			return out
 		}
@@ -189,7 +220,7 @@ func (m *Model) edited(msg editedMsg) tea.Cmd {
 		}
 		if out.err != nil {
 			// Put the error on top and edit again.
-			again := errorPrefix + strings.ReplaceAll(out.err.Error(), "\n", "\n"+errorPrefix) + "\n" + text
+			again := errorComment(out.err.Error()) + text
 			if werr := os.WriteFile(msg.path, []byte(again), 0o600); werr != nil {
 				out.err = werr
 			}
@@ -201,12 +232,24 @@ func (m *Model) edited(msg editedMsg) tea.Cmd {
 func (m *Model) manifestParsed(msg manifestMsg) tea.Cmd {
 	name := msg.act.name
 	switch {
+	case msg.kept != "":
+		m.setStatus(msg.note+"; your manifest is kept at "+msg.kept, true)
+		return nil
+	case msg.note != "":
+		m.setStatus(msg.note, true)
+		return nil
 	case msg.cancelled:
-		os.Remove(msg.path)
-		if name == "edit" {
-			m.setStatus("no changes; edit cancelled", false)
+		kept := ""
+		if msg.retried && !msg.emptied {
+			// The file holds the user's text the server failed; keep it.
+			kept = "; your manifest is kept at " + msg.path
 		} else {
-			m.setStatus(name+" cancelled", false)
+			os.Remove(msg.path)
+		}
+		if name == "edit" {
+			m.setStatus("no changes; edit cancelled"+kept, false)
+		} else {
+			m.setStatus(name+" cancelled"+kept, false)
 		}
 		return nil
 	case msg.err != nil && msg.path == "":
@@ -216,15 +259,15 @@ func (m *Model) manifestParsed(msg manifestMsg) tea.Cmd {
 		m.setStatus("manifest: "+msg.err.Error()+" (editing again)", true)
 		return m.openEditor(msg.editMsg)
 	}
-	os.Remove(msg.path)
 	if msg.key != m.cur || m.backend == nil {
-		m.setStatus("the view changed while editing; "+name+" cancelled", true)
+		m.setStatus("the view changed while editing; "+name+" cancelled; your manifest is kept at "+msg.path, true)
 		return nil
 	}
+	os.Remove(msg.path)
 	retry := msg.editMsg
 	retry.path, retry.original = "", msg.text
 	m.confirm = &confirm{act: msg.act, key: msg.key, targets: []target{{id: msg.id, name: msg.id, obj: msg.obj}},
-		diff: msg.diff, retry: &retry}
+		diff: msg.diff, retry: &retry, warnings: m.manifestWarnings(msg.key, msg.obj)}
 	m.mode, m.input = modeConfirm, ""
 	return nil
 }
@@ -239,11 +282,109 @@ func refused(err error) bool {
 	return apierrors.IsInvalid(err) || apierrors.IsBadRequest(err) || apierrors.IsAlreadyExists(err)
 }
 
-// editAgain reopens the editor on a refused manifest with the server's
-// error on top. Saving it unchanged cancels, as kubectl edit does.
-func (m *Model) editAgain(retry *editMsg, err error) tea.Cmd {
-	again := errorPrefix + strings.ReplaceAll(errString(err), "\n", "\n"+errorPrefix) + "\n" + retry.original
-	return writeManifest(*retry, again)
+// manifestFailed keeps the user's text after the server failed a create or
+// an edit. A refusal or a Conflict reopens the editor on it with the error
+// on top, as kubectl edit does; any other failure (a timeout, Forbidden,
+// NotFound, Unavailable), or one after the view changed, saves it to a
+// temp file and says where.
+func (m *Model) manifestFailed(bt *actionBatch, err error) tea.Cmd {
+	retry := *bt.retry
+	retry.retried = true
+	summary := batchSummary(bt)
+	if bt.key == m.cur && m.backend != nil && (refused(err) || apierrors.IsConflict(err)) {
+		m.setStatus(summary+" (editing again)", true)
+		if apierrors.IsConflict(err) && retry.act == editAction {
+			return m.rebaseEdit(retry, err)
+		}
+		return editAgain(retry, err, "")
+	}
+	m.setStatus(summary, true)
+	text := errorComment(errString(err)) + retry.original
+	return func() tea.Msg {
+		path, werr := writeTemp(text)
+		if werr != nil {
+			return manifestMsg{editMsg: editMsg{act: retry.act}, note: summary + "; your manifest could not be kept: " + werr.Error()}
+		}
+		return manifestMsg{editMsg: editMsg{act: retry.act}, kept: path, note: summary}
+	}
+}
+
+// errorComment is s as the error comment lines a manifest starts with.
+func errorComment(s string) string {
+	return errorPrefix + strings.ReplaceAll(s, "\n", "\n"+errorPrefix) + "\n"
+}
+
+// editAgain reopens the editor on the user's text with the server's error,
+// and note if any, on top. Saving it unchanged cancels, as kubectl edit
+// does, and keeps the text on disk.
+func editAgain(retry editMsg, err error, note string) tea.Cmd {
+	head := errorComment(errString(err))
+	if note != "" {
+		head += errorComment(note)
+	}
+	return writeManifest(retry, head+retry.original)
+}
+
+// rebaseEdit handles an edit that lost a race: it reads the object again,
+// moves the user's text onto the latest resourceVersion, and reopens the
+// editor. Saving it with a change applies the text over the latest
+// version, and the confirm dialog shows the diff against that version, so
+// a change made meanwhile that the text would undo is visible first.
+func (m *Model) rebaseEdit(retry editMsg, err error) tea.Cmd {
+	o, ok := retry.orig.(metav1.Object)
+	kd := lookupKind(string(retry.key.kind))
+	if !ok || kd == nil || kd.fetch == nil {
+		return editAgain(retry, err, "")
+	}
+	b, id, scope := m.backend, objID(o), retry.key.scope
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), actionTimeout)
+		defer cancel()
+		rows, ferr := kd.fetch(ctx, b, scope, time.Now())
+		if ferr != nil {
+			return editAgain(retry, err, "could not read the latest version: "+errString(ferr)+"; saving retries against the version you edited")()
+		}
+		for _, r := range rows {
+			latest, ok := r.obj.(metav1.Object)
+			if r.id != id || !ok {
+				continue
+			}
+			retry.orig = r.obj
+			text, ok := setResourceVersion(retry.original, latest.GetResourceVersion())
+			retry.original = text
+			if !ok {
+				return editAgain(retry, err, "it changed since you read it: set metadata.resourceVersion to "+strconv.Quote(latest.GetResourceVersion())+" (the latest), or remove it, then save to apply your text over that version; quit to cancel")()
+			}
+			return editAgain(retry, err, "it changed since you read it: your text below now targets the latest version. Save it with any change to apply it over that version (the confirm dialog diffs against it), or quit to cancel")()
+		}
+		return editAgain(retry, err, id+" no longer exists")()
+	}
+}
+
+// resourceVersionLine is metadata's resourceVersion in block style, at any
+// indent; managedFields, the only other place it can appear, is removed
+// before editing.
+var resourceVersionLine = regexp.MustCompile(`(?m)^([ \t]+)resourceVersion:.*$`)
+
+// setResourceVersion points the metadata of a manifest at rv. Without a
+// resourceVersion line parseEdit takes the edited object's, which is rv. ok
+// is false when the text still names another version (a layout the line
+// match does not know, such as flow style).
+func setResourceVersion(text, rv string) (string, bool) {
+	if loc := resourceVersionLine.FindStringSubmatchIndex(text); loc != nil {
+		text = text[:loc[0]] + text[loc[2]:loc[3]] + "resourceVersion: " + strconv.Quote(rv) + text[loc[1]:]
+	}
+	var obj struct {
+		Metadata struct {
+			ResourceVersion *string `json:"resourceVersion"`
+		} `json:"metadata"`
+	}
+	if err := yaml.Unmarshal([]byte(text), &obj); err != nil {
+		// parseEdit reports the YAML error itself.
+		return text, true
+	}
+	got := obj.Metadata.ResourceVersion
+	return text, got == nil || *got == rv
 }
 
 // parseManifest reads one protojson-shaped YAML document strictly, so a
@@ -432,4 +573,34 @@ source_actor:
 `, as, actor)
 	}
 	return ""
+}
+
+// manifestWarnings flags what a create or edit would do that is likely a
+// mistake. A SandboxConfig marked as its class's default, when another
+// config of the class already is, makes two: easy to do by starting from
+// `kubectl get -o yaml` of the current default.
+func (m *Model) manifestWarnings(k viewKey, obj any) []string {
+	c, ok := obj.(*infrav1.SandboxConfig)
+	if !ok || c.Annotations[infrav1.SandboxConfigClassDefaultAnnotation] != "true" {
+		return nil
+	}
+	d := m.data[k]
+	if d == nil {
+		return nil
+	}
+	var others []string
+	for _, r := range d.rows {
+		o, ok := r.obj.(*infrav1.SandboxConfig)
+		if !ok || o.Name == c.Name || o.DeletionTimestamp != nil || o.Spec.SandboxClass != c.Spec.SandboxClass ||
+			o.Annotations[infrav1.SandboxConfigClassDefaultAnnotation] != "true" {
+			continue
+		}
+		others = append(others, o.Name)
+	}
+	if len(others) == 0 {
+		return nil
+	}
+	sort.Strings(others)
+	return []string{fmt.Sprintf("%s is already the default for class %s; this makes %d defaults. Remove the %s annotation unless that is intended.",
+		strings.Join(others, ", "), c.Spec.SandboxClass, len(others)+1, infrav1.SandboxConfigClassDefaultAnnotation)}
 }

@@ -191,7 +191,7 @@ func (m *Model) switchContext(name string) tea.Cmd {
 	m.backend, m.info, m.connErr = nil, ConnInfo{Context: name}, nil
 	m.forwards = nil
 	m.data, m.tables = map[viewKey]*dataset{}, map[viewKey]*tableState{}
-	m.timeline, m.lastState = nil, map[string]string{}
+	m.timeline, m.lastState, m.lastSeen = nil, map[string]string{}, map[string]time.Time{}
 	m.want, m.worker, m.atespace = wantRow{}, "", ""
 	k := m.cur.kind
 	if workerScoped(k) {

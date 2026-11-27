@@ -137,6 +137,8 @@ type Model struct {
 
 	timeline  []tlEvent
 	lastState map[string]string
+	// lastSeen is when each actor's lastState was observed.
+	lastSeen map[string]time.Time
 
 	status    string
 	statusErr bool
@@ -173,6 +175,7 @@ func New(opts Options) *Model {
 		data:       map[viewKey]*dataset{},
 		tables:     map[viewKey]*tableState{},
 		lastState:  map[string]string{},
+		lastSeen:   map[string]time.Time{},
 		batches:    map[int]*actionBatch{},
 		repoll:     300 * time.Millisecond,
 		started:    time.Now(),
@@ -353,16 +356,22 @@ func (m *Model) setAtespace(a string) tea.Cmd {
 }
 
 func (m *Model) setStatus(s string, isErr bool) {
-	m.status, m.statusErr, m.fetchErr = s, isErr, false
+	m.status, m.statusErr, m.fetchErr = printable(s, toPlain), isErr, false
 }
 
-func (m *Model) selected() *row {
-	d := m.data[m.cur]
-	t := m.table()
-	if d == nil || t.cursor >= len(t.visible) || len(t.visible) == 0 {
+func (m *Model) selected() *row { return m.selectedIn(m.cur) }
+
+// selectedIn is the row under view k's cursor. Indexes that no longer fit
+// the dataset (rows replaced since the table was built) select nothing.
+func (m *Model) selectedIn(k viewKey) *row {
+	d, t := m.data[k], m.tables[k]
+	if d == nil || t == nil || t.cursor < 0 || t.cursor >= len(t.visible) {
 		return nil
 	}
-	return &d.rows[t.visible[t.cursor]]
+	if i := t.visible[t.cursor]; i < len(d.rows) {
+		return &d.rows[i]
+	}
+	return nil
 }
 
 func (m *Model) selectedID() string {
@@ -383,6 +392,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.pager != nil && m.pager.resize != nil {
 			m.pager.resize()
+		}
+		if p := m.pager; p != nil {
+			// A new height moves the last page: keep following the end, and
+			// keep the offset inside the lines.
+			if p.follow {
+				p.offset = len(p.lines)
+			}
+			p.scroll(0, m.pagerHeight())
 		}
 		return m, nil
 
@@ -420,17 +437,27 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Remember the selection against the old rows so the cursor stays on
 		// the same object after the refresh.
 		keep := ""
+		if r := m.selectedIn(msg.key); r != nil {
+			keep = r.id
+		}
 		if msg.key == m.cur {
-			keep = m.keepID(m.selectedID())
+			keep = m.keepID(keep)
 		}
 		d.loading = false
 		d.fetchedAt = msg.at
 		d.err = msg.err
 		if msg.err == nil {
 			d.rows = msg.rows
+			// Marks of rows that are gone neither count nor come back.
+			m.pruneMarks(msg.key)
 			if msg.key.kind == kActors {
 				m.recordTimeline(msg.rows, msg.at)
 			}
+		}
+		// A table not on screen still indexes the old rows; rebuild it so
+		// switching back finds valid indexes and the same selected row.
+		if t := m.tables[msg.key]; t != nil && msg.key != m.cur {
+			t.rebuild(d.rows, m.columns(msg.key.kind), keep)
 		}
 		if m.pulse != nil && pulseKeys[msg.key] {
 			cmd = m.pulseRefresh()
@@ -470,7 +497,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.pager.loading = false
 		if msg.err != nil {
-			m.pager.setLines([]string{stStatusErr.Render(errString(msg.err))}, m.pagerHeight())
+			m.pager.setLines([]string{stStatusErr.Render(printable(errString(msg.err), toPlain))}, m.pagerHeight())
 		} else {
 			m.pager.setLines(msg.lines, m.pagerHeight())
 		}
@@ -580,6 +607,12 @@ const maxTimeline = 5000
 func (m *Model) recordTimeline(rows []row, at time.Time) {
 	for i := range rows {
 		r := &rows[i]
+		// Fetches of different scopes overlap; an older observation
+		// arriving late would record a change back and forth.
+		if last, ok := m.lastSeen[r.id]; ok && at.Before(last) {
+			continue
+		}
+		m.lastSeen[r.id] = at
 		state := r.cells[2] + "@" + r.cells[4]
 		prev, seen := m.lastState[r.id]
 		if seen && prev == state {

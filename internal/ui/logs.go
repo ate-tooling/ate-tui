@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -25,10 +26,25 @@ import (
 // same pod resumes from the kubelet timestamp of the last line shown. The
 // streams run in goroutines; Update only decides which one should be open.
 
+// clockSkew is how far another node's clock may run behind this one's
+// when a move starts the new pod's read from the old pod's cursor.
+const clockSkew = time.Minute
+
 const (
 	maxLogLines = 20000
-	// logTail bounds the history read on the first connect.
+	// maxLogBytes bounds the text the entries hold, so a burst of long
+	// lines cannot take the memory maxLogLines short ones would not.
+	maxLogBytes = 64 << 20
+	// maxWrapRows bounds the rows one entry wraps to.
+	maxWrapRows = 200
+	// logTail bounds the history read on the first connect to a pod.
 	logTail = 5000
+	// maxLineBytes is how much of one log line is read; the rest of a
+	// longer line is skipped, so the stream goes on past it.
+	maxLineBytes = 1 << 20
+	// lineTailBytes is how much of an overlong line's end is kept: the
+	// worker writes its labels there.
+	lineTailBytes = 4 << 10
 )
 
 // logSource is the `c` filter. The names are kubectl ate logs --source's.
@@ -59,14 +75,23 @@ type logLine struct {
 	kind  lineKind
 	isErr bool
 	head  string // styled time and source
-	msg   string
+	raw   string // the message as logged, for the clipboard
+	msg   string // the message as one plain row, for search
 	lower string
 	text  string // head + styled msg, the render without a search
 }
 
-func newLogLine(kind lineKind, head, msg string, isErr bool) logLine {
-	l := logLine{kind: kind, head: head, msg: msg, lower: strings.ToLower(msg), isErr: isErr}
+func newLogLine(kind lineKind, head, raw string, isErr bool) logLine {
+	msg := printable(raw, toPlain)
+	l := logLine{kind: kind, head: head, raw: raw, msg: msg, lower: strings.ToLower(msg), isErr: isErr}
+	// A container's own colors stay; the reset keeps them off the rest of
+	// the row.
 	l.text = head + l.style()(msg)
+	if kind == lineContainer {
+		if shown := printable(raw, toRow); shown != msg {
+			l.text = head + shown + ansi.ResetStyle
+		}
+	}
 	return l
 }
 
@@ -126,10 +151,25 @@ type logStream struct {
 	cancel  context.CancelFunc
 	ns, pod string
 
+	// draining is set once the stream in flight is cancelled: what it
+	// already read still comes in, and then settle acts on next, the
+	// actor as last seen, and gone. pending are the states the actor
+	// passed while it drained, for their wait notices.
+	draining bool
+	// catchingUp is set while the retired pod's last lines are read once
+	// more, without following: cancelling the follow stream loses the
+	// lines it had in flight.
+	catchingUp bool
+	next       *ateapi.Actor
+	pending    []ateapi.ActorState
+	gone       bool
+
 	// lastPod is the pod the cursor belongs to, and cursor the kubelet
-	// timestamp of the last line shown from it.
+	// timestamp of the last line shown from it. Each node has its own
+	// clock, so cursors keeps the cursor of every pod left behind.
 	lastPod   string
 	cursor    time.Time
+	cursors   map[string]time.Time
 	waiting   bool
 	waitState ateapi.ActorState
 	polling   bool
@@ -140,6 +180,7 @@ type logStream struct {
 
 	entries []logLine
 	seq     int
+	bytes   int // the text the entries hold
 
 	source    logSource
 	wrap      bool
@@ -156,7 +197,36 @@ func (s *logStream) stop() {
 	if s.cancel != nil {
 		s.cancel()
 	}
-	s.stream, s.cancel, s.ch = 0, nil, nil
+	s.stream, s.cancel, s.ch, s.draining, s.catchingUp = 0, nil, nil, false, false
+}
+
+// retire cancels the stream in flight but keeps taking the lines it has
+// already read, which are often the old pod's last (a crash, a shutdown).
+// When it ends, settle acts on what the actor did meanwhile.
+func (s *logStream) retire(a *ateapi.Actor) {
+	if s.cancel != nil {
+		s.cancel()
+	}
+	s.cancel, s.draining = nil, true
+	s.saw(a)
+}
+
+// saw records the actor seen while the stream drains.
+func (s *logStream) saw(a *ateapi.Actor) {
+	if a == nil {
+		return
+	}
+	s.next = a
+	if st := a.GetStatus().GetState(); !runningOnPod(a) && (len(s.pending) == 0 || s.pending[len(s.pending)-1] != st) {
+		s.pending = append(s.pending, st)
+	}
+}
+
+// runningOnPod reports an actor whose worker pod can be streamed.
+func runningOnPod(a *ateapi.Actor) bool {
+	st := a.GetStatus()
+	wa := st.GetWorkerAssignment()
+	return wa.GetWorkerPod() != "" && wa.GetWorkerNamespace() != "" && st.GetState() == ateapi.ActorState_ACTOR_STATE_RUNNING
 }
 
 func (s *logStream) shows(l *logLine) bool {
@@ -239,7 +309,14 @@ func (m *Model) logActor(msg logActorMsg) tea.Cmd {
 	s.polling = false
 	if msg.err != nil {
 		if status.Code(msg.err) == codes.NotFound {
-			s.stop()
+			if s.stream != 0 {
+				// Show what the stream already read before what was kept.
+				if !s.draining {
+					s.retire(nil)
+				}
+				s.gone = true
+				return nil
+			}
 			if s.lastPod != "" {
 				return m.keepDeleted()
 			}
@@ -254,32 +331,77 @@ func (m *Model) logActor(msg logActorMsg) tea.Cmd {
 // reports now.
 func (m *Model) observeActor(a *ateapi.Actor) tea.Cmd {
 	s := m.logs
-	st := a.GetStatus()
-	wa := st.GetWorkerAssignment()
-	state := st.GetState()
-	if wa.GetWorkerPod() == "" || wa.GetWorkerNamespace() == "" || state != ateapi.ActorState_ACTOR_STATE_RUNNING {
-		s.stop()
-		if !s.waiting || state != s.waitState {
-			s.waiting, s.waitState = true, state
-			m.appendLogs([]logLine{notice("waiting: actor is " + explain.ActorState(state))})
+	if s.draining {
+		s.saw(a)
+		return nil
+	}
+	wa := a.GetStatus().GetWorkerAssignment()
+	if !runningOnPod(a) {
+		if s.stream != 0 {
+			// The wait notice goes after the lines the stream has read.
+			s.retire(a)
+			return nil
 		}
+		m.waitNotice(a.GetStatus().GetState())
 		return nil
 	}
 	s.waiting = false
 	ns, pod := wa.GetWorkerNamespace(), wa.GetWorkerPod()
-	if s.stream != 0 && s.ns == ns && s.pod == pod {
+	if s.stream != 0 {
+		if s.ns != ns || s.pod != pod {
+			s.retire(a)
+		}
 		return nil
 	}
-	s.stop()
 	key := ns + "/" + pod
-	switched := key != s.lastPod
-	if switched {
+	if key != s.lastPod {
 		if s.lastPod != "" {
 			m.appendLogs([]logLine{notice("── moved to " + key + " ──")})
+			if s.cursors == nil {
+				s.cursors = map[string]time.Time{}
+			}
+			s.cursors[s.lastPod] = s.cursor
 		}
-		s.lastPod = key
+		// Another node's clock: resume from this pod's own cursor, if the
+		// actor has been here before. Else start a little before the old
+		// pod's cursor: what this pod logged for the actor earlier than
+		// that is from an earlier stay, already shown or not this run's.
+		prev := s.cursor
+		s.lastPod, s.cursor = key, s.cursors[key]
+		if s.cursor.IsZero() && !prev.IsZero() {
+			s.cursor = prev.Add(-clockSkew)
+		}
 	}
-	return m.startStream(ns, pod, switched)
+	return m.startStream(ns, pod)
+}
+
+func (m *Model) waitNotice(state ateapi.ActorState) {
+	s := m.logs
+	if !s.waiting || state != s.waitState {
+		s.waiting, s.waitState = true, state
+		m.appendLogs([]logLine{notice("waiting: actor is " + explain.ActorState(state))})
+	}
+}
+
+// settle acts, once a retired stream has ended, on what the actor did
+// while it drained.
+func (m *Model) settle() tea.Cmd {
+	s := m.logs
+	next, pending, gone := s.next, s.pending, s.gone
+	s.next, s.pending, s.gone = nil, nil, false
+	for _, st := range pending {
+		m.waitNotice(st)
+	}
+	if gone {
+		if s.lastPod != "" {
+			return m.keepDeleted()
+		}
+		return nil
+	}
+	if next != nil {
+		return m.observeActor(next)
+	}
+	return nil
 }
 
 // keepDeleted turns the pager to what the last pod kept once the actor is
@@ -290,28 +412,29 @@ func (m *Model) keepDeleted() tea.Cmd {
 	s.kept, s.waiting = true, false
 	m.appendLogs([]logLine{notice("── actor deleted; showing what " + s.lastPod + " kept ──")})
 	ns, pod, _ := strings.Cut(s.lastPod, "/")
-	return m.startStream(ns, pod, false)
+	return m.startStream(ns, pod)
 }
 
-func (m *Model) startStream(ns, pod string, switched bool) tea.Cmd {
+// startStream opens lastPod's stream from its cursor.
+func (m *Model) startStream(ns, pod string) tea.Cmd {
+	return m.readStream(ns, pod, !m.logs.kept)
+}
+
+// readStream reads ns/pod from the cursor, following it or up to now.
+func (m *Model) readStream(ns, pod string, follow bool) tea.Cmd {
 	s := m.logs
 	// The kubelet's own timestamp on each line is the cursor: SinceTime is
 	// compared against it, and it does not depend on the actor's clock.
-	opts := &corev1.PodLogOptions{Follow: !s.kept, Timestamps: true}
+	opts := &corev1.PodLogOptions{Follow: follow, Timestamps: true}
 	if s.cursor.IsZero() {
 		tail := int64(logTail)
 		opts.TailLines = &tail
 	} else {
 		opts.SinceTime = &metav1.Time{Time: s.cursor}
 	}
-	// SinceTime has second precision, so a reconnect to the same pod
-	// re-reads the cursor's second. Another pod's lines are all new, and
-	// its node's clock is not this one's, so they are not compared.
-	var after time.Time
-	if !switched {
-		after = s.cursor
-	}
-	return m.runStream(ns, pod, opts, after, time.Time{})
+	// SinceTime has second precision, so a reconnect re-reads the cursor's
+	// second; after drops what was shown.
+	return m.runStream(ns, pod, opts, s.cursor, time.Time{})
 }
 
 // runStream reads ns/pod's lines for the actor stamped after after and, if
@@ -347,25 +470,132 @@ func streamLogs(ctx context.Context, b Backend, ns, pod string, opts *corev1.Pod
 		return
 	}
 	defer rc.Close()
-	sc := bufio.NewScanner(rc)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for sc.Scan() {
-		stamp, line, ok := splitKubeletTimestamp(sc.Bytes())
-		if ok && (!stamp.After(after) || !until.IsZero() && stamp.After(until)) {
-			continue
+	br := bufio.NewReaderSize(rc, 64<<10)
+	var buf, tail []byte
+	for {
+		line, t, n, err := readLogLine(br, buf, tail)
+		buf, tail = line, t
+		if n > 0 {
+			stamp, rest, ok := splitKubeletTimestamp(line)
+			if !ok || stamp.After(after) && (until.IsZero() || !stamp.After(until)) {
+				var l logLine
+				if n > len(line) {
+					l, ok = truncatedLogLine(rest, tail, n, stamp, ref.GetAtespace(), ref.GetName())
+				} else {
+					l, ok = formatLogLine(rest, ref.GetAtespace(), ref.GetName())
+				}
+				if ok {
+					l.stamp = stamp
+					if !send(l) {
+						return
+					}
+				}
+			}
 		}
-		l, ok := formatLogLine(line, ref.GetAtespace(), ref.GetName())
-		if !ok {
-			continue
-		}
-		l.stamp = stamp
-		if !send(l) {
+		if err != nil {
+			if err != io.EOF && ctx.Err() == nil {
+				send(logError("logs " + ns + "/" + pod + ": " + err.Error()))
+			}
 			return
 		}
 	}
-	if err := sc.Err(); err != nil && ctx.Err() == nil {
-		send(logError("logs " + ns + "/" + pod + ": " + err.Error()))
+}
+
+// readLogLine reads one line without its line ending into line, up to
+// maxLineBytes of it; of a longer line, tail is its last lineTailBytes. n is
+// the line's whole length. line and tail reuse the given buffers.
+func readLogLine(br *bufio.Reader, line, tail []byte) (_, _ []byte, n int, err error) {
+	line, tail = line[:0], tail[:0]
+	for {
+		var frag []byte
+		frag, err = br.ReadSlice('\n')
+		if err == nil {
+			frag = frag[:len(frag)-1]
+			if len(frag) > 0 && frag[len(frag)-1] == '\r' {
+				frag = frag[:len(frag)-1]
+			}
+		}
+		n += len(frag)
+		if room := maxLineBytes - len(line); room > 0 {
+			k := min(room, len(frag))
+			line = append(line, frag[:k]...)
+			frag = frag[k:]
+		}
+		if len(frag) > 0 {
+			tail = append(tail, frag...)
+			if over := len(tail) - lineTailBytes; over > 0 {
+				tail = append(tail[:0], tail[over:]...)
+			}
+		}
+		if err != bufio.ErrBufferFull {
+			return line, tail, n, err
+		}
 	}
+}
+
+// truncatedLogLine keeps an overlong worker line for the actor: head is its
+// start after the kubelet timestamp, tail its end, n its length. Neither is
+// JSON on its own, so the labels are matched as text and the message shown
+// as far as head holds it.
+func truncatedLogLine(head, tail []byte, n int, stamp time.Time, atespace, name string) (logLine, bool) {
+	label := func(k string) (string, bool) {
+		key, _ := json.Marshal(k)
+		key = append(key, ':')
+		for _, b := range [][]byte{tail, head} {
+			if i := bytes.LastIndex(b, key); i >= 0 {
+				var v string
+				if json.NewDecoder(bytes.NewReader(b[i+len(key):])).Decode(&v) == nil {
+					return v, true
+				}
+			}
+		}
+		return "", false
+	}
+	if v, _ := label(labelActor); v != name {
+		return logLine{}, false
+	}
+	if v, _ := label(labelAtespace); v != atespace {
+		return logLine{}, false
+	}
+	container, _ := label(labelContainer)
+	if container == sandboxID {
+		return logLine{}, false
+	}
+	container = printable(container, toPlain)
+	kind, src := lineLifecycle, stLogLifecycle.Render("lifecycle")
+	if container != "" {
+		kind, src = lineContainer, stLogContainer.Render(container)
+	}
+	ts := ""
+	if !stamp.IsZero() {
+		ts = stamp.Local().Format("15:04:05")
+	}
+	msg := messagePrefix(head) + fmt.Sprintf(" … (truncated: the line is %d bytes)", n)
+	return newLogLine(kind, stLogTime.Render(ts)+" "+src+" ", msg, false), true
+}
+
+// messagePrefix is as much of the message or msg string as the start of a
+// truncated JSON line holds, at most 64 KiB of it.
+func messagePrefix(b []byte) string {
+	for _, k := range []string{`"message":"`, `"msg":"`} {
+		i := bytes.Index(b, []byte(k))
+		if i < 0 {
+			continue
+		}
+		q := b[i+len(k)-1:]
+		var v string
+		if json.NewDecoder(bytes.NewReader(q)).Decode(&v) == nil {
+			return v
+		}
+		// Cut inside the string: close it, dropping a cut escape.
+		q = q[:min(len(q), 64<<10)]
+		for cut := 0; cut < 8 && cut < len(q); cut++ {
+			if json.Unmarshal(append(q[:len(q)-cut:len(q)-cut], '"'), &v) == nil {
+				return v
+			}
+		}
+	}
+	return ""
 }
 
 // splitKubeletTimestamp splits the RFC 3339 timestamp the kubelet prefixes
@@ -391,7 +621,18 @@ func (m *Model) logChunk(msg logChunkMsg) tea.Cmd {
 	m.appendLogs(msg.lines)
 	if msg.done {
 		// The next poll reconnects, from the cursor if the pod is the same.
+		draining, caughtUp, ns, pod := s.draining, s.catchingUp, s.ns, s.pod
 		s.stop()
+		switch {
+		case draining && !caughtUp && !s.gone:
+			// Read what the retired pod logged up to now, then settle. A
+			// deleted actor's kept read does the same.
+			cmd := m.readStream(ns, pod, false)
+			s.draining, s.catchingUp = true, true
+			return cmd
+		case draining:
+			return m.settle()
+		}
 		return nil
 	}
 	return m.wait(waitLines(s.ch, s.gen, s.stream))
@@ -420,12 +661,20 @@ func (m *Model) appendLogs(lines []logLine) {
 		s.seq++
 		l.seq = s.seq
 		s.entries = append(s.entries, l)
+		s.bytes += l.size()
 		if s.shows(&l) {
 			s.addRows(p, &l, width)
 		}
 	}
-	if over := len(s.entries) - maxLogLines; over > 0 {
-		s.entries = append(s.entries[:0], s.entries[over:]...)
+	over := 0
+	for over < len(s.entries)-1 && (len(s.entries)-over > maxLogLines || s.bytes > maxLogBytes) {
+		s.bytes -= s.entries[over].size()
+		over++
+	}
+	if over > 0 {
+		n := copy(s.entries, s.entries[over:])
+		clear(s.entries[n:])
+		s.entries = s.entries[:n]
 		s.trimRows(p, s.entries[0].seq)
 	}
 	if p.follow {
@@ -434,13 +683,31 @@ func (m *Model) appendLogs(lines []logLine) {
 	p.scroll(0, m.pagerHeight())
 }
 
+// size is about the bytes the entry holds.
+func (l *logLine) size() int {
+	return len(l.head) + len(l.raw) + len(l.msg) + len(l.lower) + len(l.text)
+}
+
 func (s *logStream) addRows(p *pager, l *logLine, width int) {
 	text := l.render(s.query)
 	if s.query != "" && strings.Contains(l.lower, s.query) {
 		s.matches = append(s.matches, len(p.lines))
 	}
 	if s.wrap && width > 0 && ansi.StringWidth(text) > width {
-		for _, r := range strings.Split(ansi.Wrap(text, width, ""), "\n") {
+		// A huge line wraps to maxWrapRows; the clipboard has all of it.
+		cut := false
+		if limit := width * maxWrapRows; ansi.StringWidth(text) > limit {
+			text, cut = ansi.Truncate(text, limit, ""), true
+		}
+		rows := strings.Split(ansi.Wrap(text, width, ""), "\n")
+		if len(rows) > maxWrapRows {
+			rows, cut = rows[:maxWrapRows], true
+		}
+		if cut {
+			last := len(rows) - 1
+			rows[last] = ansi.Truncate(rows[last], width-1, "") + ansi.ResetStyle + "…"
+		}
+		for _, r := range rows {
 			p.lines = append(p.lines, r)
 			s.rowSeq = append(s.rowSeq, l.seq)
 		}
@@ -468,8 +735,10 @@ func (s *logStream) trimRows(p *pager, first int) {
 			kept = append(kept, r-n)
 		}
 	}
+	// n/N stays on the same match.
+	s.match -= len(s.matches) - len(kept)
 	s.matches = kept
-	s.match = min(s.match, max(len(s.matches)-1, 0))
+	s.match = min(max(s.match, 0), max(len(s.matches)-1, 0))
 }
 
 // rebuildLogs renders every entry again, after the filter, search, wrap or
@@ -505,6 +774,24 @@ func (m *Model) rebuildLogs() {
 	p.scroll(0, m.pagerHeight())
 }
 
+// copyText is the shown entries as logged: the original line breaks and
+// tabs, without the pager's wrapping or escape sequences.
+func (s *logStream) copyText() string {
+	var b strings.Builder
+	for i := range s.entries {
+		l := &s.entries[i]
+		if !s.shows(l) {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(ansi.Strip(l.head))
+		b.WriteString(strings.TrimRight(printable(l.raw, toCopy), "\n"))
+	}
+	return b.String()
+}
+
 // logWidth is the text width inside the pager box.
 func (m *Model) logWidth() int { return m.width - 4 }
 
@@ -523,6 +810,8 @@ func (m *Model) jumpMatch(step int) {
 
 func (m *Model) showMatch() {
 	s, p := m.logs, m.pager
+	// Like scrolling up: scrolling back to the end resumes follow.
+	p.paused = p.paused || p.follow
 	p.follow = false
 	h := m.pagerHeight()
 	// Keep a few rows of context above the match.
@@ -627,6 +916,7 @@ func formatLogLine(b []byte, atespace, name string) (logLine, bool) {
 		return logLine{}, false
 	}
 	container, _ := labels[labelContainer].(string)
+	container = printable(container, toPlain)
 	ts := ""
 	for _, k := range []string{"time", "timestamp", "ts"} {
 		if s, ok := m[k].(string); ok {

@@ -66,6 +66,18 @@ func fit(s string, w int) string {
 	if w <= 0 {
 		return ""
 	}
+	// A row can be a whole log line, up to a MiB: keep the first w+1 cells
+	// before cleaning it. Cleaning only widens what is left (a tab, a
+	// line break), so the prefix holds all that can be shown, and the
+	// extra cell keeps the "…".
+	if len(s) > 8*w+256 {
+		s = ansi.Truncate(s, w+1, "")
+	}
+	s = printable(s, toRow)
+	if strings.IndexByte(s, 0x1b) >= 0 {
+		// A style left open would color the padding and the border.
+		s += ansi.ResetStyle
+	}
 	sw := lipgloss.Width(s)
 	if sw > w {
 		return ansi.Truncate(s, w, "…")
@@ -77,6 +89,7 @@ func fit(s string, w int) string {
 func box(title string, lines []string, width, height int, border lipgloss.Style) []string {
 	inner := width - 2
 	out := make([]string, 0, height+2)
+	title = printable(title, toRow)
 	if lipgloss.Width(title) > inner-3 {
 		title = ansi.Truncate(title, max(inner-3, 0), "…")
 	}

@@ -81,8 +81,13 @@ func (m *Model) mousePager(msg tea.MouseMsg) tea.Cmd {
 		if !list || msg.Y <= headerHeight {
 			return nil
 		}
-		// Line 0 of a list is its column header.
-		i := p.offset + msg.Y - headerHeight - 1 - 1
+		// Rows start under the box's top border; line 0 of a list is its
+		// column header. The bottom border and footer are not rows.
+		r := msg.Y - headerHeight - 1
+		if r >= m.pagerHeight() {
+			return nil
+		}
+		i := p.offset + r - 1
 		n := len(p.items)
 		switch {
 		case p.forwards:

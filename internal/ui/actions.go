@@ -164,6 +164,9 @@ type confirm struct {
 	diff []string
 	// retry reopens the editor if the server refuses a create or an edit.
 	retry *editMsg
+	// warnings are what the manifest does that is likely a mistake, such
+	// as a second default for a sandbox class.
+	warnings []string
 }
 
 // want is the text a typed confirm needs.
@@ -229,6 +232,7 @@ func (m *Model) toggleMark() {
 		return
 	}
 	t := m.table()
+	t.marksGone = false
 	if t.marked[r.id] {
 		delete(t.marked, r.id)
 	} else {
@@ -236,10 +240,37 @@ func (m *Model) toggleMark() {
 	}
 }
 
-// targets are the marked rows that still exist, or the current row.
+// pruneMarks drops the marks of rows the view's data no longer lists, so
+// the title counts only live marks and an object recreated under the same
+// id does not rejoin the selection.
+func (m *Model) pruneMarks(k viewKey) {
+	t, d := m.tableFor(k), m.data[k]
+	if d == nil || len(t.marked) == 0 {
+		return
+	}
+	live := make(map[string]bool, len(d.rows))
+	for i := range d.rows {
+		live[d.rows[i].id] = true
+	}
+	for id := range t.marked {
+		if !live[id] {
+			delete(t.marked, id)
+		}
+	}
+	if len(t.marked) == 0 {
+		t.marksGone = true
+	}
+}
+
+// targets are the marked rows that still exist, or the current row when
+// nothing is marked. When every marked row is gone it returns none rather
+// than the cursor row the user never marked, and says so.
 func (m *Model) targets() []target {
-	d := m.data[m.cur]
 	t := m.table()
+	m.pruneMarks(m.cur)
+	hadMarks := t.marksGone
+	t.marksGone = false
+	d := m.data[m.cur]
 	mk := func(r *row) target {
 		name := r.id
 		if md, ok := r.obj.(interface {
@@ -258,6 +289,10 @@ func (m *Model) targets() []target {
 				out = append(out, mk(&d.rows[i]))
 			}
 		}
+	}
+	if len(out) == 0 && hadMarks {
+		m.setStatus("the marked rows no longer exist; marks cleared, nothing was changed", true)
+		return nil
 	}
 	if len(out) == 0 {
 		if r := m.selected(); r != nil {
@@ -406,9 +441,9 @@ func (m *Model) actionResult(msg actionResultMsg) tea.Cmd {
 	}
 	delete(m.batches, msg.batch)
 	m.setStatus(batchSummary(bt), bt.failed > 0)
-	if bt.retry != nil && msg.err != nil && refused(msg.err) && bt.key == m.cur {
-		m.setStatus(batchSummary(bt)+" (editing again)", true)
-		return tea.Batch(append(cmds, m.editAgain(bt.retry, msg.err))...)
+	if bt.retry != nil && msg.err != nil {
+		// Never drop the user's text: edit it again, or keep it on disk.
+		return tea.Batch(append(cmds, m.manifestFailed(bt, msg.err))...)
 	}
 	if bt.failed < bt.total {
 		key := bt.key
@@ -443,7 +478,7 @@ func actionErr(err error) string {
 	case apierrors.IsForbidden(err):
 		s += " (your kubeconfig user lacks this RBAC permission)"
 	case apierrors.IsConflict(err):
-		s += " (it changed since it was read; edit it again)"
+		s += " (it changed since it was read)"
 	}
 	return s
 }

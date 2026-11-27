@@ -286,14 +286,15 @@ func renderEvents(evs []corev1.Event, now time.Time) []string {
 	out := []string{stColHeader.Render(fmt.Sprintf("%-6s %-8s %-*s %5s  %s", "AGE", "TYPE", rw, "REASON", "COUNT", "MESSAGE"))}
 	for _, e := range sorted {
 		typ := fg(cGreen).Render(fmt.Sprintf("%-8s", e.Type))
-		msg := fg(cText).Render(e.Message)
+		text := printable(e.Message, toPlain)
+		msg := fg(cText).Render(text)
 		if e.Type == corev1.EventTypeWarning {
 			typ = fg(cRed).Bold(true).Render(fmt.Sprintf("%-8s", e.Type))
-			msg = fg(cRed).Render(e.Message)
+			msg = fg(cRed).Render(text)
 		}
 		count := ""
-		if e.Count > 1 {
-			count = fmt.Sprintf("x%d", e.Count)
+		if n := explain.EventCount(e); n > 1 {
+			count = fmt.Sprintf("x%d", n)
 		}
 		out = append(out, stDim.Render(fmt.Sprintf("%-6s ", explain.Age(explain.EventTime(e), now)))+typ+" "+
 			fg(cBlue).Render(fmt.Sprintf("%-*s", rw, e.Reason))+stDim.Render(fmt.Sprintf(" %5s  ", count))+msg)
